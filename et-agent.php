@@ -9,6 +9,97 @@
 
 defined('ABSPATH') || exit;
 
+define('ET_AGENT_VERSION', '1.0.0');
+define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
+
+/* =========================================================================
+   Auto-updater via GitHub Releases
+   ========================================================================= */
+
+add_filter('pre_set_site_transient_update_plugins', 'et_agent_check_update');
+
+function et_agent_check_update($transient) {
+    if (empty($transient->checked)) {
+        return $transient;
+    }
+
+    $plugin_file = plugin_basename(__FILE__);
+
+    if (!isset($transient->checked[$plugin_file])) {
+        return $transient;
+    }
+
+    $release = et_agent_get_latest_release();
+    if (!$release) {
+        return $transient;
+    }
+
+    $latest  = ltrim($release['tag_name'], 'v');
+    $current = $transient->checked[$plugin_file];
+
+    if (version_compare($latest, $current, '>')) {
+        $transient->response[$plugin_file] = (object) [
+            'id'          => ET_AGENT_GITHUB_REPO,
+            'slug'        => 'et-agent',
+            'plugin'      => $plugin_file,
+            'new_version' => $latest,
+            'url'         => 'https://github.com/' . ET_AGENT_GITHUB_REPO,
+            'package'     => $release['download_url'],
+        ];
+    }
+
+    return $transient;
+}
+
+function et_agent_get_latest_release(): ?array {
+    $cached = get_transient('et_agent_latest_release');
+    if ($cached !== false) {
+        return $cached ?: null;
+    }
+
+    $response = wp_remote_get(
+        'https://api.github.com/repos/' . ET_AGENT_GITHUB_REPO . '/releases/latest',
+        [
+            'headers' => ['User-Agent' => 'ET-Agent-Updater/' . ET_AGENT_VERSION],
+            'timeout' => 10,
+        ]
+    );
+
+    if (is_wp_error($response) || 200 !== wp_remote_retrieve_response_code($response)) {
+        set_transient('et_agent_latest_release', [], 6 * HOUR_IN_SECONDS);
+        return null;
+    }
+
+    $body = json_decode(wp_remote_retrieve_body($response), true);
+
+    $download_url = null;
+    foreach ($body['assets'] ?? [] as $asset) {
+        if (pathinfo($asset['name'], PATHINFO_EXTENSION) === 'zip') {
+            $download_url = $asset['browser_download_url'];
+            break;
+        }
+    }
+
+    if (!$download_url) {
+        set_transient('et_agent_latest_release', [], 6 * HOUR_IN_SECONDS);
+        return null;
+    }
+
+    $release = [
+        'tag_name'     => $body['tag_name'],
+        'download_url' => $download_url,
+    ];
+
+    set_transient('et_agent_latest_release', $release, 12 * HOUR_IN_SECONDS);
+
+    return $release;
+}
+
+// Wyczyść cache po ręcznym sprawdzeniu aktualizacji
+add_action('upgrader_process_complete', function () {
+    delete_transient('et_agent_latest_release');
+});
+
 /* =========================================================================
    Activation / Deactivation
    ========================================================================= */

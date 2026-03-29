@@ -1,0 +1,27 @@
+name: Create Release ZIP
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Build & attach et-agent.zip
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ZIP z poprawną strukturą folderów
+        run: |
+          mkdir -p build/et-agent
+          cp et-agent.php build/et-agent/
+          cd build
+          zip -r et-agent.zip et-agent/
+
+      - name: Dołącz ZIP do Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/et-agent.zip
