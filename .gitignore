@@ -1,0 +1,10 @@
+# Dane wrażliwe
+CLAUDE.md
+*.env
+*.env.*
+
+# IDE i OS
+.DS_Store
+.vscode/
+.idea/
+Thumbs.db

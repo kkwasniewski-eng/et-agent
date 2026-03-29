@@ -1,0 +1,78 @@
+name: Deploy ET Agent
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Serwer docelowy'
+        required: true
+        default: 'devns'
+        type: choice
+        options:
+          - devns
+          - nowa-itaka
+          - all
+
+env:
+  PLUGIN_DIR: public_html/wp-content/plugins/et-agent
+
+jobs:
+  # ─────────────────────────────────────────────
+  # devns (staging) — auto przy każdym push
+  # ─────────────────────────────────────────────
+  deploy-devns:
+    name: Deploy → devns (staging)
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' ||
+      github.event.inputs.target == 'devns' ||
+      github.event.inputs.target == 'all'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Upload et-agent.php via scp
+        run: |
+          sudo apt-get install -y sshpass
+
+          export SSHPASS="${{ secrets.DEVNS_PASS }}"
+          sshpass -e scp \
+            -P ${{ secrets.SSH_PORT_WEB16 }} \
+            -o StrictHostKeyChecking=no \
+            et-agent.php \
+            ${{ secrets.DEVNS_USER }}@${{ secrets.SSH_HOST_WEB16 }}:~/${{ env.PLUGIN_DIR }}/et-agent.php
+
+      - name: Weryfikacja
+        run: |
+          export SSHPASS="${{ secrets.DEVNS_PASS }}"
+          sshpass -e ssh \
+            -p ${{ secrets.SSH_PORT_WEB16 }} \
+            -o StrictHostKeyChecking=no \
+            ${{ secrets.DEVNS_USER }}@${{ secrets.SSH_HOST_WEB16 }} \
+            "echo 'devns OK:' && ls -la ~/${{ env.PLUGIN_DIR }}/"
+
+  # ─────────────────────────────────────────────
+  # nowa-itaka — tylko ręczny trigger
+  # ─────────────────────────────────────────────
+  deploy-nowa-itaka:
+    name: Deploy → nowa-itaka
+    runs-on: ubuntu-latest
+    needs: deploy-devns
+    if: |
+      github.event.inputs.target == 'nowa-itaka' ||
+      github.event.inputs.target == 'all'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Upload et-agent.php via scp
+        run: |
+          sudo apt-get install -y sshpass
+
+          export SSHPASS="${{ secrets.NOWAITAKA_PASS }}"
+          sshpass -e scp \
+            -P ${{ secrets.SSH_PORT_WEB15 }} \
+            -o StrictHostKeyChecking=no \
+            et-agent.php \
+            ${{ secrets.NOWAITAKA_USER }}@${{ secrets.SSH_HOST_WEB15 }}:~/${{ env.PLUGIN_DIR }}/et-agent.php
