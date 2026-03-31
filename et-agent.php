@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.0.1
+ * Version: 1.0.2
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.0.1');
+define('ET_AGENT_VERSION', '1.0.2');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* =========================================================================
@@ -99,6 +99,25 @@ function et_agent_get_latest_release(): ?array {
 add_action('upgrader_process_complete', function () {
     delete_transient('et_agent_latest_release');
 });
+
+// Fix: GitHub ZIP extracts to folder like "et-agent-1.0.1" — rename to "et-agent"
+add_filter('upgrader_source_selection', function ($source, $remote_source, $upgrader, $hook_extra) {
+    if (!isset($hook_extra['plugin']) || $hook_extra['plugin'] !== plugin_basename(__FILE__)) {
+        return $source;
+    }
+
+    $expected_dir = trailingslashit($remote_source) . 'et-agent';
+    if ($source === $expected_dir . '/') {
+        return $source;
+    }
+
+    global $wp_filesystem;
+    if ($wp_filesystem->move($source, $expected_dir)) {
+        return trailingslashit($expected_dir);
+    }
+
+    return $source;
+}, 10, 4);
 
 /* =========================================================================
    Activation / Deactivation
