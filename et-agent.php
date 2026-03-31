@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.0.0');
+define('ET_AGENT_VERSION', '1.0.1');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* =========================================================================
@@ -110,13 +110,21 @@ register_activation_hook(__FILE__, function () {
         update_option('et_agent_site_token', $token, false);
     }
 
+    if (!get_option('et_agent_crm_url')) {
+        update_option('et_agent_crm_url', 'https://crm.etechnologie.info.pl/', false);
+    }
+
     if (!wp_next_scheduled('et_agent_report_cron')) {
         wp_schedule_event(time(), 'twicedaily', 'et_agent_report_cron');
+    }
+    if (!wp_next_scheduled('et_agent_users_peak_cron')) {
+        wp_schedule_event(time(), 'daily', 'et_agent_users_peak_cron');
     }
 });
 
 register_deactivation_hook(__FILE__, function () {
     wp_clear_scheduled_hook('et_agent_report_cron');
+    wp_clear_scheduled_hook('et_agent_users_peak_cron');
 });
 
 /* =========================================================================
@@ -172,7 +180,170 @@ add_action('rest_api_init', function () {
         },
         'permission_callback' => $permission,
     ]);
+
+    register_rest_route($namespace, '/install-plugin', [
+        'methods'             => 'POST',
+        'callback'            => 'et_agent_install_plugin',
+        'permission_callback' => $permission,
+    ]);
+
+    register_rest_route($namespace, '/site-test', [
+        'methods'             => 'GET',
+        'callback'            => 'et_agent_site_test',
+        'permission_callback' => $permission,
+    ]);
 });
+
+/* =========================================================================
+   Remote plugin install from GitHub
+   ========================================================================= */
+
+function et_agent_install_plugin(\WP_REST_Request $request): \WP_REST_Response {
+    $body = $request->get_json_params();
+    $github_url = $body['github_url'] ?? '';
+
+    if (!preg_match('#^https://github\.com/([^/]+)/([^/]+)/?$#', $github_url, $matches)) {
+        return new \WP_REST_Response(['error' => 'Invalid GitHub URL'], 400);
+    }
+
+    $owner = $matches[1];
+    $repo  = $matches[2];
+
+    // Try latest release ZIP first
+    $download_url = null;
+    $release_response = wp_remote_get(
+        "https://api.github.com/repos/{$owner}/{$repo}/releases/latest",
+        ['headers' => ['User-Agent' => 'ET-Agent/' . ET_AGENT_VERSION], 'timeout' => 15]
+    );
+
+    if (!is_wp_error($release_response) && 200 === wp_remote_retrieve_response_code($release_response)) {
+        $release_body = json_decode(wp_remote_retrieve_body($release_response), true);
+        foreach ($release_body['assets'] ?? [] as $asset) {
+            if (pathinfo($asset['name'], PATHINFO_EXTENSION) === 'zip') {
+                $download_url = $asset['browser_download_url'];
+                break;
+            }
+        }
+        if (!$download_url && !empty($release_body['zipball_url'])) {
+            $download_url = $release_body['zipball_url'];
+        }
+    }
+
+    if (!$download_url) {
+        $download_url = "https://github.com/{$owner}/{$repo}/archive/refs/heads/main.zip";
+    }
+
+    require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+    require_once ABSPATH . 'wp-admin/includes/plugin.php';
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    require_once ABSPATH . 'wp-admin/includes/misc.php';
+
+    $skin     = new \WP_Ajax_Upgrader_Skin();
+    $upgrader = new \Plugin_Upgrader($skin);
+    $result   = $upgrader->install($download_url);
+
+    if (is_wp_error($result)) {
+        return new \WP_REST_Response(['error' => $result->get_error_message()], 500);
+    }
+    if ($result === false) {
+        $errors = $skin->get_errors();
+        $msg = $errors->has_errors() ? $errors->get_error_message() : 'Installation failed';
+        return new \WP_REST_Response(['error' => $msg], 500);
+    }
+
+    return new \WP_REST_Response([
+        'status'      => 'installed',
+        'plugin_info' => $upgrader->plugin_info(),
+    ]);
+}
+
+/* =========================================================================
+   Remote site health test
+   ========================================================================= */
+
+function et_agent_site_test(\WP_REST_Request $request): \WP_REST_Response {
+    $checks  = [];
+    $overall = 'ok';
+
+    // 1. Homepage loads
+    $home = wp_remote_get(home_url('/'), ['timeout' => 10, 'sslverify' => false]);
+    if (is_wp_error($home)) {
+        $checks['homepage'] = ['status' => 'error', 'message' => $home->get_error_message()];
+        $overall = 'error';
+    } else {
+        $code = wp_remote_retrieve_response_code($home);
+        $checks['homepage'] = ['status' => ($code === 200) ? 'ok' : 'warning', 'message' => "HTTP {$code}"];
+        if ($code !== 200) $overall = 'warning';
+    }
+
+    // 2. Admin loads (302 redirect to login is OK, 5xx is error)
+    $admin = wp_remote_get(admin_url('/'), ['timeout' => 10, 'sslverify' => false, 'redirection' => 0]);
+    if (is_wp_error($admin)) {
+        $checks['admin'] = ['status' => 'error', 'message' => $admin->get_error_message()];
+        $overall = 'error';
+    } else {
+        $code = wp_remote_retrieve_response_code($admin);
+        $ok = ($code < 500);
+        $checks['admin'] = ['status' => $ok ? 'ok' : 'error', 'message' => "HTTP {$code}"];
+        if (!$ok) $overall = 'error';
+    }
+
+    // 3. Database
+    global $wpdb;
+    $db_result = $wpdb->get_var("SELECT 1");
+    $checks['database'] = [
+        'status'  => ($db_result == 1) ? 'ok' : 'error',
+        'message' => ($db_result == 1) ? 'Connected' : 'Query failed',
+    ];
+    if ($db_result != 1) $overall = 'error';
+
+    // 4. Recent fatals in debug.log (last hour)
+    $debug_log = WP_CONTENT_DIR . '/debug.log';
+    if (file_exists($debug_log) && is_readable($debug_log)) {
+        $lines = array_slice(file($debug_log), -50);
+        $recent_fatals = 0;
+        $one_hour_ago = time() - 3600;
+        foreach ($lines as $line) {
+            if (stripos($line, 'PHP Fatal') !== false) {
+                if (preg_match('/\[(\d{2}-\w{3}-\d{4}\s[\d:]+)\s/', $line, $m)) {
+                    $ts = strtotime($m[1]);
+                    if ($ts && $ts > $one_hour_ago) $recent_fatals++;
+                } else {
+                    $recent_fatals++;
+                }
+            }
+        }
+        $checks['debug_log'] = [
+            'status'  => $recent_fatals > 0 ? 'warning' : 'ok',
+            'message' => $recent_fatals > 0 ? "{$recent_fatals} fatal(i) w ostatniej godzinie" : 'Brak błędów',
+        ];
+        if ($recent_fatals > 0 && $overall === 'ok') $overall = 'warning';
+    } else {
+        $checks['debug_log'] = ['status' => 'ok', 'message' => 'Brak debug.log'];
+    }
+
+    // 5. Active plugins sanity (files exist?)
+    if (!function_exists('get_plugins')) {
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+    }
+    $active  = get_option('active_plugins', []);
+    $all     = get_plugins();
+    $missing = array_diff($active, array_keys($all));
+    $checks['plugins'] = [
+        'status'       => empty($missing) ? 'ok' : 'warning',
+        'message'      => empty($missing)
+            ? count($active) . ' aktywnych, wszystkie OK'
+            : count($missing) . ' brakujących plików pluginów',
+        'active_count' => count($active),
+    ];
+    if (!empty($missing) && $overall === 'ok') $overall = 'warning';
+
+    return new \WP_REST_Response([
+        'status'    => $overall,
+        'checks'    => $checks,
+        'timestamp' => gmdate('Y-m-d\TH:i:sP'),
+    ]);
+}
 
 /* =========================================================================
    Report data collector
@@ -220,6 +391,7 @@ function et_agent_collect_report(): array {
         ],
         'disk'        => $disk,
         'users_count' => $users_count,
+        'users_peak'  => get_option('et_agent_users_peak', []),
         'site_url'    => get_site_url(),
         'admin_email' => get_option('admin_email'),
     ];
@@ -244,11 +416,11 @@ function et_agent_get_disk_usage(): array {
     $used_mb = null;
     $home_dir = getenv('HOME') ?: dirname(dirname(ABSPATH));
 
-    // Method 1: du -sm (fast, works on most hosts)
+    // Method 1: du -sk (KB — universally supported), convert to MB
     if (function_exists('shell_exec')) {
-        $output = @shell_exec("du -sm " . escapeshellarg($home_dir) . " 2>/dev/null");
+        $output = @shell_exec("du -sk " . escapeshellarg($home_dir) . " 2>/dev/null");
         if ($output && preg_match('/^(\d+)/', $output, $m)) {
-            $used_mb = (int) $m[1];
+            $used_mb = (int) round((int) $m[1] / 1024);
         }
     }
 
@@ -328,6 +500,17 @@ add_action('init', function () {
 
 add_action('et_agent_report_cron', 'et_agent_send_report');
 
+/* --- Users peak tracking (daily cron) --- */
+add_action('et_agent_users_peak_cron', 'et_agent_update_users_peak');
+
+function et_agent_update_users_peak(): void {
+    $current_count = (int) count_users()['total_users'];
+    $month_key = date('Y-m');
+    $peak = get_option('et_agent_users_peak', []);
+    $peak[$month_key] = max($peak[$month_key] ?? 0, $current_count);
+    update_option('et_agent_users_peak', $peak, false);
+}
+
 function et_agent_send_report(): void {
     $crm_url = get_option('et_agent_crm_url', '');
     $token   = get_option('et_agent_site_token', '');
@@ -372,6 +555,74 @@ function et_agent_send_report(): void {
 }
 
 /* =========================================================================
+   Plugin list — action links (Generate / Regenerate Site Key)
+   ========================================================================= */
+
+add_filter('plugin_action_links_' . plugin_basename(__FILE__), function (array $links): array {
+    $token = get_option('et_agent_site_token', '');
+    $label = $token ? 'Regeneruj Site Key' : 'Generuj Site Key';
+    $url   = wp_nonce_url(
+        admin_url('plugins.php?et_agent_generate_key=1'),
+        'et_agent_generate_key'
+    );
+    array_unshift($links, sprintf(
+        '<a href="%s" style="color:#d63638">%s</a>',
+        esc_url($url),
+        esc_html($label)
+    ));
+
+    $settings_url = admin_url('options-general.php?page=et-agent');
+    array_unshift($links, sprintf(
+        '<a href="%s">Ustawienia</a>',
+        esc_url($settings_url)
+    ));
+
+    return $links;
+});
+
+add_action('admin_init', function () {
+    if (empty($_GET['et_agent_generate_key'])) {
+        return;
+    }
+    check_admin_referer('et_agent_generate_key');
+    if (!current_user_can('manage_options')) {
+        wp_die('Brak uprawnień.');
+    }
+
+    $token = bin2hex(random_bytes(32));
+    update_option('et_agent_site_token', $token, false);
+
+    add_settings_error(
+        'general',
+        'et_agent_key_generated',
+        'Nowy Site Key został wygenerowany: ' . $token,
+        'updated'
+    );
+    set_transient('settings_errors', get_settings_errors(), 30);
+    wp_safe_redirect(admin_url('plugins.php?settings-updated=true'));
+    exit;
+});
+
+add_action('admin_notices', function () {
+    if (!isset($_GET['settings-updated']) || $_SERVER['SCRIPT_NAME'] !== '/wp-admin/plugins.php') {
+        return;
+    }
+    $errors = get_transient('settings_errors');
+    if (!$errors) {
+        return;
+    }
+    delete_transient('settings_errors');
+    foreach ($errors as $error) {
+        if ($error['code'] === 'et_agent_key_generated') {
+            printf(
+                '<div class="notice notice-success is-dismissible"><p>%s</p></div>',
+                esc_html($error['message'])
+            );
+        }
+    }
+});
+
+/* =========================================================================
    Settings page
    ========================================================================= */
 
@@ -389,7 +640,7 @@ add_action('admin_init', function () {
     register_setting('et_agent_settings', 'et_agent_crm_url', [
         'type'              => 'string',
         'sanitize_callback' => 'esc_url_raw',
-        'default'           => '',
+        'default'           => 'https://crm.etechnologie.info.pl/',
     ]);
 
     register_setting('et_agent_settings', 'et_agent_disk_quota_mb', [
@@ -434,7 +685,7 @@ add_action('admin_init', function () {
             $url = get_option('et_agent_crm_url', '');
             ?>
             <input type="url" name="et_agent_crm_url" value="<?php echo esc_attr($url); ?>"
-                   class="regular-text" placeholder="https://crm.etechnologie.pl" />
+                   class="regular-text" placeholder="https://crm.etechnologie.info.pl/" />
             <p class="description">Adres CRM, do którego agent wysyła raporty.</p>
             <?php
         },
