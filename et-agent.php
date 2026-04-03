@@ -12,6 +12,16 @@ defined('ABSPATH') || exit;
 define('ET_AGENT_VERSION', '1.0.2');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
+/* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
+add_filter('bb_enable_private_rest_apis_public_content', function ($endpoints) {
+    $endpoints = trim($endpoints);
+    if ($endpoints !== '') {
+        $endpoints .= "\n";
+    }
+    $endpoints .= '/et-agent/v1';
+    return $endpoints;
+});
+
 /* =========================================================================
    Auto-updater via GitHub Releases
    ========================================================================= */
