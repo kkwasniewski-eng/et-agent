@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.0.4
+ * Version: 1.0.5
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.0.4');
+define('ET_AGENT_VERSION', '1.0.5');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -293,6 +293,7 @@ function et_agent_smtp_test(\WP_REST_Request $request): \WP_REST_Response {
 function et_agent_install_plugin(\WP_REST_Request $request): \WP_REST_Response {
     $body = $request->get_json_params();
     $github_url = $body['github_url'] ?? '';
+    $force = !empty($body['force']);
     $github_token = $body['github_token']
         ?? (defined('ET_AGENT_GITHUB_TOKEN') ? ET_AGENT_GITHUB_TOKEN : '')
         ?: get_option('et_agent_github_token', '');
@@ -369,7 +370,10 @@ function et_agent_install_plugin(\WP_REST_Request $request): \WP_REST_Response {
 
     $skin     = new \WP_Ajax_Upgrader_Skin();
     $upgrader = new \Plugin_Upgrader($skin);
-    $result   = $upgrader->install($download_url);
+    $install_args = $force
+        ? ['overwrite_package' => true, 'clear_destination' => true, 'abort_if_destination_exists' => false]
+        : [];
+    $result   = $upgrader->install($download_url, $install_args);
 
     if ($auth_filter) {
         remove_filter('http_request_args', $auth_filter, 10);
@@ -395,8 +399,39 @@ function et_agent_install_plugin(\WP_REST_Request $request): \WP_REST_Response {
         'status'      => 'installed',
         'plugin_info' => $upgrader->plugin_info(),
         'used_token'  => (bool) $github_token,
+        'forced'      => $force,
     ]);
 }
+
+/* =========================================================================
+   Plugin row "Sprawdź aktualizacje" link + force-check transient invalidation
+   ========================================================================= */
+
+add_filter('plugin_action_links_' . plugin_basename(__FILE__), function ($links) {
+    $url = wp_nonce_url(admin_url('admin-post.php?action=et_agent_force_check'), 'et_agent_force_check');
+    $links[] = '<a href="' . esc_url($url) . '">' . esc_html__('Sprawdź aktualizacje', 'et-agent') . '</a>';
+    return $links;
+});
+
+add_action('admin_post_et_agent_force_check', function () {
+    if (!current_user_can('update_plugins')) {
+        wp_die('Forbidden');
+    }
+    check_admin_referer('et_agent_force_check');
+    delete_transient('et_agent_latest_release');
+    delete_site_transient('update_plugins');
+    wp_update_plugins();
+    wp_safe_redirect(admin_url('update-core.php?force-check=1&et_agent_checked=1'));
+    exit;
+});
+
+// When WP itself is asked for force-check, also drop our cache so the next
+// pre_set_site_transient_update_plugins fires a fresh GitHub query.
+add_action('admin_init', function () {
+    if (isset($_GET['force-check']) && current_user_can('update_plugins')) {
+        delete_transient('et_agent_latest_release');
+    }
+});
 
 /* =========================================================================
    Remote site health test
