@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.0.2
+ * Version: 1.0.3
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.0.2');
+define('ET_AGENT_VERSION', '1.0.3');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -230,26 +230,36 @@ add_action('rest_api_init', function () {
 function et_agent_install_plugin(\WP_REST_Request $request): \WP_REST_Response {
     $body = $request->get_json_params();
     $github_url = $body['github_url'] ?? '';
+    $github_token = $body['github_token']
+        ?? (defined('ET_AGENT_GITHUB_TOKEN') ? ET_AGENT_GITHUB_TOKEN : '')
+        ?: get_option('et_agent_github_token', '');
 
-    if (!preg_match('#^https://github\.com/([^/]+)/([^/]+)/?$#', $github_url, $matches)) {
+    if (!preg_match('#^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$#', $github_url, $matches)) {
         return new \WP_REST_Response(['error' => 'Invalid GitHub URL'], 400);
     }
 
     $owner = $matches[1];
     $repo  = $matches[2];
 
+    $base_headers = ['User-Agent' => 'ET-Agent/' . ET_AGENT_VERSION];
+    if ($github_token) {
+        $base_headers['Authorization'] = 'Bearer ' . $github_token;
+    }
+
     // Try latest release ZIP first
     $download_url = null;
     $release_response = wp_remote_get(
         "https://api.github.com/repos/{$owner}/{$repo}/releases/latest",
-        ['headers' => ['User-Agent' => 'ET-Agent/' . ET_AGENT_VERSION], 'timeout' => 15]
+        ['headers' => $base_headers + ['Accept' => 'application/vnd.github+json'], 'timeout' => 15]
     );
 
     if (!is_wp_error($release_response) && 200 === wp_remote_retrieve_response_code($release_response)) {
         $release_body = json_decode(wp_remote_retrieve_body($release_response), true);
         foreach ($release_body['assets'] ?? [] as $asset) {
             if (pathinfo($asset['name'], PATHINFO_EXTENSION) === 'zip') {
-                $download_url = $asset['browser_download_url'];
+                $download_url = $github_token
+                    ? "https://api.github.com/repos/{$owner}/{$repo}/releases/assets/{$asset['id']}"
+                    : $asset['browser_download_url'];
                 break;
             }
         }
@@ -259,7 +269,34 @@ function et_agent_install_plugin(\WP_REST_Request $request): \WP_REST_Response {
     }
 
     if (!$download_url) {
-        $download_url = "https://github.com/{$owner}/{$repo}/archive/refs/heads/main.zip";
+        $repo_info_response = wp_remote_get(
+            "https://api.github.com/repos/{$owner}/{$repo}",
+            ['headers' => $base_headers + ['Accept' => 'application/vnd.github+json'], 'timeout' => 15]
+        );
+        $default_branch = 'main';
+        if (!is_wp_error($repo_info_response) && 200 === wp_remote_retrieve_response_code($repo_info_response)) {
+            $info = json_decode(wp_remote_retrieve_body($repo_info_response), true);
+            $default_branch = $info['default_branch'] ?? 'main';
+        }
+        $download_url = "https://api.github.com/repos/{$owner}/{$repo}/zipball/{$default_branch}";
+    }
+
+    // Inject Authorization on all GitHub requests during install
+    $auth_filter = null;
+    if ($github_token) {
+        $auth_filter = function ($args, $url) use ($github_token, $download_url) {
+            $is_github = strpos($url, 'github.com') !== false || strpos($url, 'githubusercontent.com') !== false;
+            if (!$is_github) {
+                return $args;
+            }
+            $args['headers']['Authorization'] = 'Bearer ' . $github_token;
+            $args['headers']['User-Agent'] = 'ET-Agent/' . ET_AGENT_VERSION;
+            if ($url === $download_url && strpos($url, 'releases/assets/') !== false) {
+                $args['headers']['Accept'] = 'application/octet-stream';
+            }
+            return $args;
+        };
+        add_filter('http_request_args', $auth_filter, 10, 2);
     }
 
     require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
@@ -271,18 +308,30 @@ function et_agent_install_plugin(\WP_REST_Request $request): \WP_REST_Response {
     $upgrader = new \Plugin_Upgrader($skin);
     $result   = $upgrader->install($download_url);
 
+    if ($auth_filter) {
+        remove_filter('http_request_args', $auth_filter, 10);
+    }
+
     if (is_wp_error($result)) {
         return new \WP_REST_Response(['error' => $result->get_error_message()], 500);
     }
+
+    $skin_errors = $skin->get_errors();
+    if ($skin_errors && $skin_errors->has_errors()) {
+        return new \WP_REST_Response([
+            'error'      => $skin_errors->get_error_message(),
+            'used_token' => (bool) $github_token,
+        ], 409);
+    }
+
     if ($result === false) {
-        $errors = $skin->get_errors();
-        $msg = $errors->has_errors() ? $errors->get_error_message() : 'Installation failed';
-        return new \WP_REST_Response(['error' => $msg], 500);
+        return new \WP_REST_Response(['error' => 'Installation failed'], 500);
     }
 
     return new \WP_REST_Response([
         'status'      => 'installed',
         'plugin_info' => $upgrader->plugin_info(),
+        'used_token'  => (bool) $github_token,
     ]);
 }
 
