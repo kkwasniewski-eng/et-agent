@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.0.5
+ * Version: 1.0.6
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.0.5');
+define('ET_AGENT_VERSION', '1.0.6');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -110,14 +110,21 @@ add_action('upgrader_process_complete', function () {
     delete_transient('et_agent_latest_release');
 });
 
-// Fix: GitHub ZIP extracts to folder like "et-agent-1.0.1" — rename to "et-agent"
+// Fix: rename source folder to match the currently installed plugin folder
+// (e.g. "et-agent" or "et-agent-main" depending on how the plugin was first
+// installed — using the active basename keeps Plugin_Upgrader happy).
 add_filter('upgrader_source_selection', function ($source, $remote_source, $upgrader, $hook_extra) {
     if (!isset($hook_extra['plugin']) || $hook_extra['plugin'] !== plugin_basename(__FILE__)) {
         return $source;
     }
 
-    $expected_dir = trailingslashit($remote_source) . 'et-agent';
-    if ($source === $expected_dir . '/') {
+    $target_dir_name = dirname(plugin_basename(__FILE__));
+    if ($target_dir_name === '.' || $target_dir_name === '') {
+        $target_dir_name = 'et-agent';
+    }
+    $expected_dir = trailingslashit($remote_source) . $target_dir_name;
+
+    if (rtrim($source, '/') === rtrim($expected_dir, '/')) {
         return $source;
     }
 
@@ -128,6 +135,51 @@ add_filter('upgrader_source_selection', function ($source, $remote_source, $upgr
 
     return $source;
 }, 10, 4);
+
+// Cleanup leftover et-agent-X.Y.Z/ folders that broken upgrades left behind.
+// Runs on plugin activation and on each report cron tick.
+function et_agent_cleanup_duplicate_folders(): void {
+    if (!function_exists('get_plugins')) {
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+    }
+
+    $current_basename = plugin_basename(__FILE__);
+    $plugins_dir = WP_PLUGIN_DIR;
+    if (!is_dir($plugins_dir)) {
+        return;
+    }
+
+    foreach (scandir($plugins_dir) as $entry) {
+        if (!preg_match('/^et-agent-\d+\.\d+\.\d+$/', $entry)) {
+            continue;
+        }
+        $candidate = $plugins_dir . '/' . $entry;
+        if (!is_dir($candidate)) {
+            continue;
+        }
+        // Skip the currently active plugin folder, just in case.
+        if (dirname($current_basename) === $entry) {
+            continue;
+        }
+        // Safety: only remove if it really looks like an ET Agent leftover.
+        $main_file = $candidate . '/et-agent.php';
+        $weird_file = $candidate . '/et-agent\\et-agent.php';
+        if (!file_exists($main_file) && !file_exists($weird_file)) {
+            continue;
+        }
+        et_agent_rrmdir($candidate);
+    }
+}
+
+function et_agent_rrmdir(string $dir): void {
+    if (!is_dir($dir)) return;
+    foreach (scandir($dir) as $item) {
+        if ($item === '.' || $item === '..') continue;
+        $path = $dir . '/' . $item;
+        is_dir($path) ? et_agent_rrmdir($path) : @unlink($path);
+    }
+    @rmdir($dir);
+}
 
 /* =========================================================================
    Activation / Deactivation
@@ -149,7 +201,11 @@ register_activation_hook(__FILE__, function () {
     if (!wp_next_scheduled('et_agent_users_peak_cron')) {
         wp_schedule_event(time(), 'daily', 'et_agent_users_peak_cron');
     }
+
+    et_agent_cleanup_duplicate_folders();
 });
+
+add_action('et_agent_report_cron', 'et_agent_cleanup_duplicate_folders');
 
 register_deactivation_hook(__FILE__, function () {
     wp_clear_scheduled_hook('et_agent_report_cron');
