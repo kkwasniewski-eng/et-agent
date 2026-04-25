@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.0.3
+ * Version: 1.0.4
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.0.3');
+define('ET_AGENT_VERSION', '1.0.4');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -221,7 +221,70 @@ add_action('rest_api_init', function () {
         'callback'            => 'et_agent_site_test',
         'permission_callback' => $permission,
     ]);
+
+    register_rest_route($namespace, '/smtp-test', [
+        'methods'             => 'POST',
+        'callback'            => 'et_agent_smtp_test',
+        'permission_callback' => $permission,
+    ]);
 });
+
+/* =========================================================================
+   SMTP test - send a probe email and capture wp_mail_failed errors
+   ========================================================================= */
+
+function et_agent_smtp_test(\WP_REST_Request $request): \WP_REST_Response {
+    $body = $request->get_json_params();
+    $recipient = $body['recipient'] ?? 'smtp-test@etechnologie.pl';
+    $subject = $body['subject'] ?? 'ET Agent SMTP test - ' . parse_url(home_url(), PHP_URL_HOST);
+    $message = $body['body'] ?? "ET Agent SMTP probe.\nSite: " . home_url() . "\nTime: " . gmdate('c');
+
+    if (!is_email($recipient)) {
+        return new \WP_REST_Response(['success' => false, 'error' => 'Invalid recipient email'], 400);
+    }
+
+    $captured_error = null;
+    $error_listener = function ($wp_error) use (&$captured_error) {
+        if (is_a($wp_error, 'WP_Error')) {
+            $captured_error = $wp_error->get_error_message();
+        }
+    };
+    add_action('wp_mail_failed', $error_listener);
+
+    $detected_mailer = null;
+    $mailer_inspector = function ($phpmailer) use (&$detected_mailer) {
+        $detected_mailer = $phpmailer->Mailer ?? 'unknown';
+        if ($detected_mailer === 'smtp') {
+            $detected_mailer .= ' (' . ($phpmailer->Host ?? 'unknown') . ':' . ($phpmailer->Port ?? '?') . ')';
+        }
+    };
+    add_action('phpmailer_init', $mailer_inspector);
+
+    $started = microtime(true);
+    $sent = wp_mail($recipient, $subject, $message);
+    $elapsed_ms = (int) round((microtime(true) - $started) * 1000);
+
+    remove_action('wp_mail_failed', $error_listener);
+    remove_action('phpmailer_init', $mailer_inspector);
+
+    if ($sent && !$captured_error) {
+        return new \WP_REST_Response([
+            'success'    => true,
+            'mailer'     => $detected_mailer ?? 'unknown',
+            'sent_to'    => $recipient,
+            'subject'    => $subject,
+            'elapsed_ms' => $elapsed_ms,
+        ]);
+    }
+
+    return new \WP_REST_Response([
+        'success'    => false,
+        'error'      => $captured_error ?? 'wp_mail() returned false without raising wp_mail_failed',
+        'mailer'     => $detected_mailer ?? 'unknown',
+        'sent_to'    => $recipient,
+        'elapsed_ms' => $elapsed_ms,
+    ], 502);
+}
 
 /* =========================================================================
    Remote plugin install from GitHub
