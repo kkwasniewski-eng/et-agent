@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.0.6
+ * Version: 1.0.7
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.0.6');
+define('ET_AGENT_VERSION', '1.0.7');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -361,6 +361,18 @@ function et_agent_install_plugin(\WP_REST_Request $request): \WP_REST_Response {
     $owner = $matches[1];
     $repo  = $matches[2];
 
+    $default_trusted = ['kkwasniewski-eng', 'eTechnologie-org'];
+    $trusted_owners = defined('ET_AGENT_GITHUB_TRUSTED_OWNERS')
+        ? array_map('trim', explode(',', ET_AGENT_GITHUB_TRUSTED_OWNERS))
+        : $default_trusted;
+    $trusted_owners = apply_filters('et_agent_trusted_github_owners', $trusted_owners);
+
+    if (!in_array($owner, $trusted_owners, true)) {
+        return new \WP_REST_Response([
+            'error' => "Repo owner '{$owner}' nie jest na whitelist. Dozwolone: " . implode(', ', $trusted_owners),
+        ], 403);
+    }
+
     $base_headers = ['User-Agent' => 'ET-Agent/' . ET_AGENT_VERSION];
     if ($github_token) {
         $base_headers['Authorization'] = 'Bearer ' . $github_token;
@@ -687,8 +699,16 @@ function et_agent_get_report(\WP_REST_Request $request): \WP_REST_Response {
 }
 
 function et_agent_auto_login(\WP_REST_Request $request): \WP_REST_Response {
-    $body    = $request->get_json_params();
-    $user_id = isset($body['user_id']) ? (int) $body['user_id'] : 1;
+    $body = $request->get_json_params();
+
+    if (empty($body['user_id'])) {
+        return new \WP_REST_Response(['error' => 'user_id parameter required'], 400);
+    }
+
+    $user_id = (int) $body['user_id'];
+    if ($user_id < 1) {
+        return new \WP_REST_Response(['error' => 'Invalid user_id'], 400);
+    }
 
     $user = get_user_by('id', $user_id);
     if (!$user) {
