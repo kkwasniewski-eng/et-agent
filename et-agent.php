@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.0.8
+ * Version: 1.0.9
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.0.8');
+define('ET_AGENT_VERSION', '1.0.9');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -215,6 +215,28 @@ register_activation_hook(__FILE__, function () {
 });
 
 add_action('et_agent_report_cron', 'et_agent_cleanup_duplicate_folders');
+
+// Defensive scheduling — runs on every request, ensures crons are registered
+// even when plugin was upgraded via Plugin_Upgrader (which does NOT call
+// register_activation_hook). Cheap: each wp_next_scheduled is a single autoload
+// option lookup.
+add_action('init', function () {
+    if (!wp_next_scheduled('et_agent_report_cron')) {
+        wp_schedule_event(time(), 'twicedaily', 'et_agent_report_cron');
+    }
+    if (!wp_next_scheduled('et_agent_users_peak_cron')) {
+        wp_schedule_event(time(), 'daily', 'et_agent_users_peak_cron');
+    }
+    if (!wp_next_scheduled('et_agent_disk_measure_cron')) {
+        $jitter = mt_rand(0, 7200);
+        wp_schedule_event(time() + $jitter, 'daily', 'et_agent_disk_measure_cron');
+    }
+    // First-time measurement if no value recorded yet
+    if (get_option('et_agent_disk_used_mb_measured', null) === null
+        && !wp_next_scheduled('et_agent_disk_measure_now')) {
+        wp_schedule_single_event(time() + 60, 'et_agent_disk_measure_now');
+    }
+});
 
 register_deactivation_hook(__FILE__, function () {
     wp_clear_scheduled_hook('et_agent_report_cron');
