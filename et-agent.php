@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.0.7
+ * Version: 1.0.8
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.0.7');
+define('ET_AGENT_VERSION', '1.0.8');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -201,6 +201,15 @@ register_activation_hook(__FILE__, function () {
     if (!wp_next_scheduled('et_agent_users_peak_cron')) {
         wp_schedule_event(time(), 'daily', 'et_agent_users_peak_cron');
     }
+    if (!wp_next_scheduled('et_agent_disk_measure_cron')) {
+        // Stagger across ~2h window to avoid all sites measuring at once
+        $jitter = mt_rand(0, 7200);
+        wp_schedule_event(time() + $jitter, 'daily', 'et_agent_disk_measure_cron');
+    }
+    // First-time measurement on activation (in 30s, async)
+    if (!wp_next_scheduled('et_agent_disk_measure_now')) {
+        wp_schedule_single_event(time() + 30, 'et_agent_disk_measure_now');
+    }
 
     et_agent_cleanup_duplicate_folders();
 });
@@ -210,6 +219,8 @@ add_action('et_agent_report_cron', 'et_agent_cleanup_duplicate_folders');
 register_deactivation_hook(__FILE__, function () {
     wp_clear_scheduled_hook('et_agent_report_cron');
     wp_clear_scheduled_hook('et_agent_users_peak_cron');
+    wp_clear_scheduled_hook('et_agent_disk_measure_cron');
+    wp_clear_scheduled_hook('et_agent_disk_measure_now');
 });
 
 /* =========================================================================
@@ -281,6 +292,19 @@ add_action('rest_api_init', function () {
     register_rest_route($namespace, '/smtp-test', [
         'methods'             => 'POST',
         'callback'            => 'et_agent_smtp_test',
+        'permission_callback' => $permission,
+    ]);
+
+    register_rest_route($namespace, '/disk-measure', [
+        'methods'             => 'POST',
+        'callback'            => function () {
+            $mb = et_agent_measure_disk_usage();
+            return new \WP_REST_Response([
+                'used_mb'      => $mb,
+                'measured_at'  => get_option('et_agent_disk_measured_at', null),
+                'elapsed_s'    => get_option('et_agent_disk_measured_elapsed_s', null),
+            ], $mb === null ? 500 : 200);
+        },
         'permission_callback' => $permission,
     ]);
 });
@@ -642,53 +666,111 @@ function et_agent_collect_report(): array {
 }
 
 /* =========================================================================
-   Disk usage — hosting-aware
+   Disk usage — measured by cron, read from option
    ========================================================================= */
 
 function et_agent_get_disk_usage(): array {
     $total_mb = (int) get_option('et_agent_disk_quota_mb', 0) ?: null;
 
-    // Try cached value first (du can be slow on large dirs)
-    $cached = get_transient('et_agent_disk_used_mb');
-    if ($cached !== false) {
-        $used_mb = (int) $cached;
-        $free_mb = ($total_mb && $used_mb) ? ($total_mb - $used_mb) : null;
-        return ['total_mb' => $total_mb, 'used_mb' => $used_mb, 'free_mb' => $free_mb];
-    }
+    $measured = get_option('et_agent_disk_used_mb_measured', null);
+    $used_mb = ($measured !== null && $measured !== '') ? (int) $measured : null;
 
-    // Calculate disk usage
-    $used_mb = null;
-    $home_dir = getenv('HOME') ?: dirname(dirname(ABSPATH));
-
-    // Method 1: du -sk (KB — universally supported), convert to MB
-    if (function_exists('shell_exec')) {
+    // Fallback for hosts where shell_exec is enabled (VPS, dedicated) —
+    // tries du -sk on demand. Disabled functions on shared hosting (jdm.pl)
+    // skip this branch silently.
+    if ($used_mb === null && function_exists('shell_exec')) {
+        $home_dir = getenv('HOME') ?: dirname(dirname(ABSPATH));
         $output = @shell_exec("du -sk " . escapeshellarg($home_dir) . " 2>/dev/null");
         if ($output && preg_match('/^(\d+)/', $output, $m)) {
             $used_mb = (int) round((int) $m[1] / 1024);
         }
     }
 
-    // Method 2: Fallback to disk_total_space/disk_free_space (shows server disk, not quota)
-    if ($used_mb === null) {
-        $disk_total = @disk_total_space(ABSPATH);
-        $disk_free  = @disk_free_space(ABSPATH);
-        if ($disk_total && $disk_free) {
-            if (!$total_mb) {
-                $total_mb = (int) round($disk_total / 1048576);
+    // We deliberately DO NOT fall back to disk_total_space() / disk_free_space()
+    // on shared hosting they report the entire partition (TB scale) and CRM
+    // would mistake it for client data.
+
+    $free_mb = ($total_mb && $used_mb !== null) ? max(0, $total_mb - $used_mb) : null;
+
+    return [
+        'total_mb' => $total_mb,
+        'used_mb'  => $used_mb,
+        'free_mb'  => $free_mb,
+        'measured_at' => get_option('et_agent_disk_measured_at', null),
+    ];
+}
+
+function et_agent_measure_disk_usage(): ?int {
+    // Build list of paths to scan, respecting open_basedir restrictions
+    // common on shared hosting (e.g. jdm.pl).
+    $candidates = [];
+    $home_dir = getenv('HOME') ?: '';
+    if ($home_dir && is_dir($home_dir) && is_readable($home_dir)) {
+        $candidates[] = rtrim($home_dir, '/\\');
+    } else {
+        // Fallback: scan known user subdirs that open_basedir typically allows.
+        // ABSPATH = .../public_html/ → parent is the user home root.
+        $public_html = rtrim(ABSPATH, '/\\');
+        $maybe_home = dirname($public_html);
+        foreach ([$public_html, $maybe_home . '/logs', $maybe_home . '/.tmp'] as $p) {
+            if (is_dir($p) && is_readable($p)) {
+                $candidates[] = $p;
             }
-            $used_mb = (int) round(($disk_total - $disk_free) / 1048576);
         }
     }
 
-    // Cache for 1 hour
-    if ($used_mb !== null) {
-        set_transient('et_agent_disk_used_mb', $used_mb, 3600);
+    if (empty($candidates)) {
+        update_option('et_agent_disk_measure_error', 'no readable paths', false);
+        return null;
     }
 
-    $free_mb = ($total_mb && $used_mb !== null) ? ($total_mb - $used_mb) : null;
+    @set_time_limit(0);
+    @ignore_user_abort(true);
 
-    return ['total_mb' => $total_mb, 'used_mb' => $used_mb, 'free_mb' => $free_mb];
+    $bytes = 0;
+    $files = 0;
+    $started = microtime(true);
+
+    foreach ($candidates as $dir) {
+        try {
+            $iterator = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator(
+                    $dir,
+                    \RecursiveDirectoryIterator::SKIP_DOTS
+                ),
+                \RecursiveIteratorIterator::LEAVES_ONLY,
+                \RecursiveIteratorIterator::CATCH_GET_CHILD
+            );
+            foreach ($iterator as $file) {
+                try {
+                    if ($file->isFile() && !$file->isLink()) {
+                        $bytes += $file->getSize();
+                        $files++;
+                    }
+                } catch (\Throwable $e) {
+                    // skip unreadable file
+                }
+            }
+        } catch (\Throwable $e) {
+            // skip unreadable root dir
+        }
+    }
+
+    $mb = (int) round($bytes / 1048576);
+    $elapsed = round(microtime(true) - $started, 1);
+
+    update_option('et_agent_disk_used_mb_measured', $mb, false);
+    update_option('et_agent_disk_measured_at', current_time('mysql'), false);
+    update_option('et_agent_disk_measured_elapsed_s', $elapsed, false);
+    update_option('et_agent_disk_measured_paths', implode(',', $candidates), false);
+    update_option('et_agent_disk_measured_files', $files, false);
+    delete_option('et_agent_disk_measure_error');
+
+    return $mb;
 }
+
+add_action('et_agent_disk_measure_cron', 'et_agent_measure_disk_usage');
+add_action('et_agent_disk_measure_now', 'et_agent_measure_disk_usage');
 
 /* =========================================================================
    Endpoint callbacks
