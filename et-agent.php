@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.0.9
+ * Version: 1.1.0
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.0.9');
+define('ET_AGENT_VERSION', '1.1.0');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -462,14 +462,16 @@ function et_agent_install_plugin(\WP_REST_Request $request): \WP_REST_Response {
     // Inject Authorization on all GitHub requests during install
     $auth_filter = null;
     if ($github_token) {
-        $auth_filter = function ($args, $url) use ($github_token, $download_url) {
+        $auth_filter = function ($args, $url) use ($github_token) {
             $is_github = strpos($url, 'github.com') !== false || strpos($url, 'githubusercontent.com') !== false;
             if (!$is_github) {
                 return $args;
             }
             $args['headers']['Authorization'] = 'Bearer ' . $github_token;
             $args['headers']['User-Agent'] = 'ET-Agent/' . ET_AGENT_VERSION;
-            if ($url === $download_url && strpos($url, 'releases/assets/') !== false) {
+            // GitHub API releases/assets endpoint zwraca JSON bez tego headera (a my chcemy binary).
+            // Equality check on $download_url zawodzi bo WP normalizuje URL przed http_request_args.
+            if (strpos($url, '/releases/assets/') !== false) {
                 $args['headers']['Accept'] = 'application/octet-stream';
             }
             return $args;
