@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.1.0
+ * Version: 1.2.0
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.1.0');
+define('ET_AGENT_VERSION', '1.2.0');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -305,6 +305,12 @@ add_action('rest_api_init', function () {
         'permission_callback' => $permission,
     ]);
 
+    register_rest_route($namespace, '/update-plugin', [
+        'methods'             => 'POST',
+        'callback'            => 'et_agent_update_plugin',
+        'permission_callback' => $permission,
+    ]);
+
     register_rest_route($namespace, '/site-test', [
         'methods'             => 'GET',
         'callback'            => 'et_agent_site_test',
@@ -516,6 +522,79 @@ function et_agent_install_plugin(\WP_REST_Request $request): \WP_REST_Response {
         'plugin_info' => $upgrader->plugin_info(),
         'used_token'  => (bool) $github_token,
         'forced'      => $force,
+    ]);
+}
+
+/* =========================================================================
+   Remote plugin update (native WP source - works for premium plugins like Gravity Forms)
+   ========================================================================= */
+
+function et_agent_update_plugin(\WP_REST_Request $request): \WP_REST_Response {
+    $body = $request->get_json_params();
+    $plugin_basename = $body['plugin_basename'] ?? '';
+
+    if (!preg_match('#^[a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-]+\.php$#', $plugin_basename)) {
+        return new \WP_REST_Response(['error' => 'Invalid plugin_basename (expected format: dir/file.php)'], 400);
+    }
+
+    require_once ABSPATH . 'wp-admin/includes/plugin.php';
+    require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    require_once ABSPATH . 'wp-admin/includes/misc.php';
+    require_once ABSPATH . 'wp-admin/includes/update.php';
+
+    $all_plugins = get_plugins();
+    if (!isset($all_plugins[$plugin_basename])) {
+        return new \WP_REST_Response(['error' => "Plugin '{$plugin_basename}' nie jest zainstalowany"], 404);
+    }
+    $old_version = $all_plugins[$plugin_basename]['Version'] ?? '?';
+
+    // Force refresh updates transient (premium plugins like Gravity Forms register their own update_plugins filter)
+    wp_clean_plugins_cache(true);
+    wp_update_plugins();
+
+    $update_plugins = get_site_transient('update_plugins');
+    if (!isset($update_plugins->response[$plugin_basename])) {
+        return new \WP_REST_Response([
+            'status'      => 'no-update',
+            'plugin'      => $plugin_basename,
+            'old_version' => $old_version,
+            'message'     => 'Brak dostępnego update (już aktualna wersja lub brak license)',
+        ]);
+    }
+
+    $available_version = $update_plugins->response[$plugin_basename]->new_version ?? '?';
+
+    $skin     = new \WP_Ajax_Upgrader_Skin();
+    $upgrader = new \Plugin_Upgrader($skin);
+    $result   = $upgrader->upgrade($plugin_basename);
+
+    if (is_wp_error($result)) {
+        return new \WP_REST_Response(['error' => $result->get_error_message(), 'old_version' => $old_version], 500);
+    }
+
+    $skin_errors = $skin->get_errors();
+    if ($skin_errors && $skin_errors->has_errors()) {
+        return new \WP_REST_Response([
+            'error'       => $skin_errors->get_error_message(),
+            'old_version' => $old_version,
+        ], 409);
+    }
+
+    if ($result === false) {
+        return new \WP_REST_Response(['error' => 'Update failed', 'old_version' => $old_version], 500);
+    }
+
+    // Re-read installed version to confirm
+    wp_clean_plugins_cache(true);
+    $all_plugins_after = get_plugins();
+    $new_version = $all_plugins_after[$plugin_basename]['Version'] ?? $available_version;
+
+    return new \WP_REST_Response([
+        'status'      => 'updated',
+        'plugin'      => $plugin_basename,
+        'old_version' => $old_version,
+        'new_version' => $new_version,
     ]);
 }
 
