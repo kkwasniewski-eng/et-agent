@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.2.0
+ * Version: 1.2.1
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.2.0');
+define('ET_AGENT_VERSION', '1.2.1');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -490,12 +490,27 @@ function et_agent_install_plugin(\WP_REST_Request $request): \WP_REST_Response {
     require_once ABSPATH . 'wp-admin/includes/file.php';
     require_once ABSPATH . 'wp-admin/includes/misc.php';
 
+    // Force source folder name to match repo name (zipball-based downloads have hash-suffix folders)
+    $rename_filter = function ($source, $remote_source) use ($repo) {
+        global $wp_filesystem;
+        $current = basename(rtrim($source, '/\\'));
+        if ($current === $repo) return $source;
+        $new_source = trailingslashit($remote_source) . $repo . '/';
+        if ($wp_filesystem && $wp_filesystem->move($source, $new_source, true)) {
+            return $new_source;
+        }
+        return $source;
+    };
+    add_filter('upgrader_source_selection', $rename_filter, 10, 2);
+
     $skin     = new \WP_Ajax_Upgrader_Skin();
     $upgrader = new \Plugin_Upgrader($skin);
     $install_args = $force
         ? ['overwrite_package' => true, 'clear_destination' => true, 'abort_if_destination_exists' => false]
         : [];
     $result   = $upgrader->install($download_url, $install_args);
+
+    remove_filter('upgrader_source_selection', $rename_filter, 10);
 
     if ($auth_filter) {
         remove_filter('http_request_args', $auth_filter, 10);
