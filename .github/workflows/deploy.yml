@@ -1,8 +1,10 @@
 name: Deploy ET Agent
 
+# Auto-deploy via push wyłączony - rollout odbywa się przez:
+# 1. ET Agent self-update twicedaily cron (sprawdza GitHub releases/latest)
+# 2. CRM: php artisan plugins:bulk-update (et-agent v1.2.0+ /update-plugin endpoint)
+# Ten workflow zostaje dla rzadkich ręcznych deployów do devns/nowa-itaka.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       target:
