@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.2.2
+ * Version: 1.3.0
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.2.2');
+define('ET_AGENT_VERSION', '1.3.0');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -212,6 +212,64 @@ register_activation_hook(__FILE__, function () {
     }
 
     et_agent_cleanup_duplicate_folders();
+
+    // Auto-register with CRM (deferred 10s so REST API is fully bootstrapped)
+    if (!wp_next_scheduled('et_agent_register_now')) {
+        wp_schedule_single_event(time() + 10, 'et_agent_register_now');
+    }
+});
+
+add_action('et_agent_register_now', 'et_agent_register_with_crm');
+
+function et_agent_register_with_crm(): void {
+    if (get_option('et_agent_registered_at')) {
+        return; // already registered
+    }
+
+    $token = get_option('et_agent_site_token');
+    $crm_url = rtrim(get_option('et_agent_crm_url', 'https://crm.etechnologie.info.pl/'), '/');
+    if (!$token || !$crm_url) {
+        return;
+    }
+
+    $response = wp_remote_post($crm_url . '/api/agent/register', [
+        'timeout' => 20,
+        'headers' => [
+            'Content-Type' => 'application/json',
+            'Accept' => 'application/json',
+        ],
+        'body' => wp_json_encode([
+            'url' => home_url(),
+            'name' => get_bloginfo('name') ?: parse_url(home_url(), PHP_URL_HOST),
+            'site_token' => $token,
+        ]),
+    ]);
+
+    if (is_wp_error($response)) {
+        update_option('et_agent_register_error', $response->get_error_message(), false);
+        return;
+    }
+
+    $code = (int) wp_remote_retrieve_response_code($response);
+    if ($code === 200 || $code === 201) {
+        update_option('et_agent_registered_at', gmdate('c'), false);
+        delete_option('et_agent_register_error');
+    } else {
+        $body = wp_remote_retrieve_body($response);
+        update_option('et_agent_register_error', "HTTP $code: " . substr($body, 0, 300), false);
+    }
+}
+
+// Defensive retry: if registration failed, retry on each admin page load (cheap)
+add_action('admin_init', function () {
+    if (!get_option('et_agent_registered_at') && get_option('et_agent_site_token')) {
+        // Retry max once per hour
+        $last = (int) get_option('et_agent_register_last_retry', 0);
+        if (time() - $last > 3600) {
+            update_option('et_agent_register_last_retry', time(), false);
+            et_agent_register_with_crm();
+        }
+    }
 });
 
 add_action('et_agent_report_cron', 'et_agent_cleanup_duplicate_folders');
