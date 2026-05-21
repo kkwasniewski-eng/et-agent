@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.3.0
+ * Version: 1.3.1
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.3.0');
+define('ET_AGENT_VERSION', '1.3.1');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -357,6 +357,16 @@ add_action('rest_api_init', function () {
         'permission_callback' => $permission,
     ]);
 
+    // GET /error-log?lines=N (default 20, max 200)
+    register_rest_route($namespace, '/error-log', [
+        'methods'             => 'GET',
+        'callback'            => function (\WP_REST_Request $req) {
+            $lines = max(1, min(200, (int) $req->get_param('lines') ?: 20));
+            return new \WP_REST_Response(et_agent_collect_error_logs($lines));
+        },
+        'permission_callback' => $permission,
+    ]);
+
     register_rest_route($namespace, '/install-plugin', [
         'methods'             => 'POST',
         'callback'            => 'et_agent_install_plugin',
@@ -394,6 +404,74 @@ add_action('rest_api_init', function () {
         'permission_callback' => $permission,
     ]);
 });
+
+/* =========================================================================
+   Error log collector - tail recent N lines from WP debug.log + php-error.log
+   ========================================================================= */
+function et_agent_tail_file(string $path, int $lines): ?array {
+    if (!is_readable($path)) return null;
+    $size = @filesize($path);
+    if ($size === false) return null;
+
+    // Read at most last 512 KB to avoid memory bloat on huge logs
+    $max_bytes = 512 * 1024;
+    $offset = max(0, $size - $max_bytes);
+    $fh = @fopen($path, 'rb');
+    if (!$fh) return null;
+    fseek($fh, $offset);
+    $chunk = stream_get_contents($fh);
+    fclose($fh);
+    if ($chunk === false) return null;
+
+    // If we started mid-line, drop the first partial line
+    if ($offset > 0) {
+        $nl = strpos($chunk, "\n");
+        if ($nl !== false) $chunk = substr($chunk, $nl + 1);
+    }
+
+    $rows = preg_split("/\r\n|\n|\r/", rtrim($chunk, "\r\n"));
+    if (count($rows) > $lines) $rows = array_slice($rows, -$lines);
+
+    return [
+        'path'      => $path,
+        'size'      => $size,
+        'truncated' => $size > $max_bytes,
+        'lines'     => array_values($rows),
+    ];
+}
+
+function et_agent_collect_error_logs(int $lines): array {
+    $sources = [];
+
+    // 1. WP_DEBUG_LOG: wp-content/debug.log (or custom if WP_DEBUG_LOG points to a path)
+    if (defined('WP_DEBUG_LOG') && WP_DEBUG_LOG) {
+        $candidate = is_string(WP_DEBUG_LOG)
+            ? WP_DEBUG_LOG
+            : (defined('WP_CONTENT_DIR') ? WP_CONTENT_DIR . '/debug.log' : null);
+        if ($candidate) $sources['wp_debug_log'] = $candidate;
+    } elseif (defined('WP_CONTENT_DIR') && is_file(WP_CONTENT_DIR . '/debug.log')) {
+        // WP_DEBUG_LOG off but file exists - still report it
+        $sources['wp_debug_log'] = WP_CONTENT_DIR . '/debug.log';
+    }
+
+    // 2. php error_log from ini (host-level, often ~/logs/php-error.log on JDM)
+    $ini_log = @ini_get('error_log');
+    if ($ini_log && is_string($ini_log) && $ini_log !== '' && @is_readable($ini_log)) {
+        $sources['php_error_log'] = $ini_log;
+    }
+
+    $result = ['lines_requested' => $lines, 'logs' => []];
+    foreach ($sources as $key => $path) {
+        $tail = et_agent_tail_file($path, $lines);
+        if ($tail) $result['logs'][$key] = $tail;
+        else $result['logs'][$key] = ['path' => $path, 'error' => 'unreadable or missing'];
+    }
+
+    if (empty($result['logs'])) {
+        $result['note'] = 'No log sources detected. Check WP_DEBUG_LOG and php.ini error_log.';
+    }
+    return $result;
+}
 
 /* =========================================================================
    SMTP test - send a probe email and capture wp_mail_failed errors
