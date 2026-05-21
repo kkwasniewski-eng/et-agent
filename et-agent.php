@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.3.4
+ * Version: 1.3.5
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.3.4');
+define('ET_AGENT_VERSION', '1.3.5');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -698,7 +698,8 @@ header('Retry-After: 3600');
 <style>
   *, *::before, *::after { box-sizing: border-box; }
   body { font-family: 'Inter', -apple-system, "Segoe UI", Roboto, sans-serif; background: #f8fafc; margin: 0; min-height: 100vh; display: flex; flex-direction: column; color: #0f172a; -webkit-font-smoothing: antialiased; }
-  header.site { padding: 24px 32px; border-bottom: 1px solid #e2e8f0; background: #ffffff; }
+  header.site { padding: 24px 32px; border-bottom: 1px solid #e2e8f0; background: #ffffff; text-align: center; }
+  header.site a { display: inline-block; }
   header.site img { display: block; height: 43px; width: auto; }
   main { flex: 1; display: flex; align-items: center; justify-content: center; padding: 48px 24px; }
   .card { max-width: 560px; width: 100%; text-align: center; }
