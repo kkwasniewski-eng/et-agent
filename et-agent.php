@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.3.2
+ * Version: 1.3.3
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.3.2');
+define('ET_AGENT_VERSION', '1.3.3');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -577,7 +577,6 @@ function et_agent_maintenance_status() {
 
 function et_agent_render_maintenance_dropin(string $title, string $message, string $contact_email, string $site_token): string {
     $title_html = esc_html($title);
-    // Allow simple line breaks but escape HTML
     $message_html = nl2br(esc_html($message));
     $contact_block = '';
     if ($contact_email) {
@@ -614,7 +613,7 @@ if (\$__et_auth === \$__et_token && \$__et_token !== '') {
     }
 }
 
-// === 503 maintenance page dla wszystkich pozostalych requestow ===
+// === 503 maintenance page dla wszystkich pozostalych requestow (style: etechnologie.pl) ===
 \$protocol = (!empty(\$_SERVER['SERVER_PROTOCOL']) && in_array(\$_SERVER['SERVER_PROTOCOL'], ['HTTP/1.1','HTTP/2','HTTP/2.0'], true))
     ? \$_SERVER['SERVER_PROTOCOL'] : 'HTTP/1.0';
 header(\$protocol . ' 503 Service Unavailable', true, 503);
@@ -626,23 +625,48 @@ header('Retry-After: 3600');
 <meta charset="utf-8">
 <title>{$title_html}</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: linear-gradient(135deg, #f5f7fa 0%, #e8edf2 100%); margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; color: #1a202c; }
-  .box { max-width: 520px; width: 90%; padding: 48px 36px; background: white; border-radius: 16px; box-shadow: 0 10px 40px rgba(0,0,0,0.08); text-align: center; }
-  h1 { margin: 0 0 16px; font-size: 28px; font-weight: 700; letter-spacing: -0.02em; }
-  p { color: #4a5568; line-height: 1.65; margin: 12px 0; font-size: 16px; }
-  p.contact { margin-top: 24px; padding-top: 20px; border-top: 1px solid #e2e8f0; font-size: 15px; }
-  a { color: #f97316; text-decoration: none; font-weight: 500; }
-  a:hover { text-decoration: underline; }
-  .icon { width: 64px; height: 64px; margin: 0 auto 24px; background: #fff7ed; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 32px; }
+  *, *::before, *::after { box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, "Segoe UI", Roboto, sans-serif; background: #f8fafc; margin: 0; min-height: 100vh; display: flex; flex-direction: column; color: #0f172a; -webkit-font-smoothing: antialiased; }
+  header.site { padding: 24px 32px; border-bottom: 1px solid #e2e8f0; background: #ffffff; }
+  header.site img { display: block; height: 43px; width: auto; }
+  main { flex: 1; display: flex; align-items: center; justify-content: center; padding: 48px 24px; }
+  .card { max-width: 560px; width: 100%; text-align: center; }
+  h1 { margin: 0 0 16px; font-size: 32px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.2; color: #0f172a; }
+  p { color: #475569; line-height: 1.65; margin: 0 0 16px; font-size: 17px; }
+  p.contact { margin-top: 28px; padding-top: 24px; border-top: 1px solid #e2e8f0; font-size: 15px; color: #64748b; }
+  a { color: #0f172a; text-decoration: none; font-weight: 600; border-bottom: 2px solid #f7941d; transition: color 0.15s; }
+  a:hover { color: #f7941d; }
+  .offer { margin-top: 32px; display: inline-flex; align-items: center; gap: 8px; padding: 14px 28px; background: #f7941d; color: white; border-radius: 8px; font-weight: 600; font-size: 16px; border-bottom: 0; transition: background 0.15s; }
+  .offer:hover { background: #e07f0e; color: white; }
+  .offer svg { width: 18px; height: 18px; }
+  @media (max-width: 480px) {
+    header.site { padding: 16px 20px; }
+    header.site img { height: 36px; }
+    h1 { font-size: 26px; }
+    p { font-size: 16px; }
+  }
 </style>
 </head>
 <body>
-  <main class="box" role="main">
-    <div class="icon" aria-hidden="true">⏸</div>
-    <h1>{$title_html}</h1>
-    <p>{$message_html}</p>
-    {$contact_block}
+  <header class="site">
+    <a href="https://etechnologie.pl/" rel="noopener" style="border:0">
+      <img src="https://etechnologie.pl/img/logo_etechnologie-tagline.svg" alt="eTechnologie" width="190" height="43">
+    </a>
+  </header>
+  <main>
+    <div class="card">
+      <h1>{$title_html}</h1>
+      <p>{$message_html}</p>
+      <a class="offer" href="https://etechnologie.pl/platforma-elearningowa/" rel="noopener">
+        Informacje na temat naszej oferty
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
+      </a>
+      {$contact_block}
+    </div>
   </main>
 </body>
 </html>
