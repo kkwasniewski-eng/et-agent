@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.3.3
+ * Version: 1.3.4
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.3.3');
+define('ET_AGENT_VERSION', '1.3.4');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -534,11 +534,15 @@ function et_agent_maintenance_enable(\WP_REST_Request $req) {
     update_option('et_agent_maintenance_message', $message);
     update_option('et_agent_maintenance_contact', $contact_email);
 
+    // Auto-purge JDM nginx fastcgi cache (bez tego cached HTTP 200 nadpisuje 503)
+    $purge_result = et_agent_purge_host_cache();
+
     return new \WP_REST_Response([
         'enabled' => true,
         'dropin' => $dropin_path,
         'marker' => $marker_path,
         'enabled_at' => get_option('et_agent_maintenance_enabled_at'),
+        'cache_purge' => $purge_result,
     ]);
 }
 
@@ -555,10 +559,14 @@ function et_agent_maintenance_disable() {
     delete_option('et_agent_maintenance_message');
     delete_option('et_agent_maintenance_contact');
 
+    // Auto-purge JDM nginx fastcgi cache (bez tego cached 503 nadpisuje 302)
+    $purge_result = et_agent_purge_host_cache();
+
     return new \WP_REST_Response([
         'disabled' => true,
         'marker_removed' => $marker_removed,
         'dropin_removed' => $dropin_removed,
+        'cache_purge' => $purge_result,
     ]);
 }
 
@@ -573,6 +581,42 @@ function et_agent_maintenance_status() {
         'message' => get_option('et_agent_maintenance_message'),
         'contact' => get_option('et_agent_maintenance_contact'),
     ]);
+}
+
+/**
+ * Host-specific cache purge. Currently supports JDM nginx fastcgi cache via
+ * their local API (http://localhost:11597) authenticated with JDM_AUTH_TOKEN
+ * defined in wp-config.php. Silently no-ops on other hostings.
+ */
+function et_agent_purge_host_cache(): array {
+    // JDM hosting
+    if (defined('JDM_AUTH_TOKEN') && JDM_AUTH_TOKEN) {
+        $uid = function_exists('posix_getuid') ? (string) posix_getuid() : '0';
+        $ch = curl_init('http://localhost:11597/wp/cache/purge');
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode(['pattern' => '/']),
+            CURLOPT_HTTPHEADER => [
+                'X-JDM-UID: ' . $uid,
+                'X-JDM-TOKEN: ' . trim(JDM_AUTH_TOKEN),
+                'User-Agent: JDM WP Plugin',
+                'Content-Type: application/json',
+            ],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 8,
+        ]);
+        $body = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        return [
+            'host' => 'jdm',
+            'http_code' => $code,
+            'response' => $body ? substr($body, 0, 200) : null,
+            'ok' => $code === 200 && strpos((string) $body, 'success') !== false,
+        ];
+    }
+
+    return ['host' => 'unknown', 'ok' => false, 'note' => 'No supported cache layer detected'];
 }
 
 function et_agent_render_maintenance_dropin(string $title, string $message, string $contact_email, string $site_token): string {
@@ -602,8 +646,31 @@ if (\$__et_auth === \$__et_token && \$__et_token !== '') {
         \$dropin = __FILE__;
         \$marker_removed = file_exists(\$marker) ? @unlink(\$marker) : false;
         \$dropin_removed = @unlink(\$dropin);
+
+        // JDM cache purge inline - load wp-config to get JDM_AUTH_TOKEN
+        \$purge_ok = false;
+        \$wp_config = ABSPATH . 'wp-config.php';
+        if (file_exists(\$wp_config)) {
+            \$config_src = @file_get_contents(\$wp_config);
+            if (\$config_src && preg_match('/JDM_AUTH_TOKEN\\W+([a-f0-9]{20,80})/i', \$config_src, \$m)) {
+                \$jdm_token = \$m[1];
+                \$uid = function_exists('posix_getuid') ? (string) posix_getuid() : '0';
+                \$ch = curl_init('http://localhost:11597/wp/cache/purge');
+                curl_setopt_array(\$ch, [
+                    CURLOPT_POST => true,
+                    CURLOPT_POSTFIELDS => json_encode(['pattern' => '/']),
+                    CURLOPT_HTTPHEADER => ['X-JDM-UID: '.\$uid, 'X-JDM-TOKEN: '.\$jdm_token, 'User-Agent: JDM WP Plugin', 'Content-Type: application/json'],
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_TIMEOUT => 5,
+                ]);
+                \$resp = curl_exec(\$ch);
+                curl_close(\$ch);
+                \$purge_ok = \$resp && strpos(\$resp, 'success') !== false;
+            }
+        }
+
         header('Content-Type: application/json; charset=utf-8');
-        echo json_encode(['disabled' => true, 'method' => 'dropin_bypass', 'marker_removed' => \$marker_removed, 'dropin_removed' => \$dropin_removed]);
+        echo json_encode(['disabled' => true, 'method' => 'dropin_bypass', 'marker_removed' => \$marker_removed, 'dropin_removed' => \$dropin_removed, 'cache_purge_ok' => \$purge_ok]);
         exit;
     }
     if (strpos(\$__et_uri, '/wp-json/et-agent/v1/maintenance/status') !== false) {
