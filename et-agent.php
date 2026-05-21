@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.3.1
+ * Version: 1.3.2
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.3.1');
+define('ET_AGENT_VERSION', '1.3.2');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -367,6 +367,27 @@ add_action('rest_api_init', function () {
         'permission_callback' => $permission,
     ]);
 
+    // POST /maintenance/enable - body: title, message, contact_email
+    register_rest_route($namespace, '/maintenance/enable', [
+        'methods'             => 'POST',
+        'callback'            => 'et_agent_maintenance_enable',
+        'permission_callback' => $permission,
+    ]);
+
+    // POST /maintenance/disable
+    register_rest_route($namespace, '/maintenance/disable', [
+        'methods'             => 'POST',
+        'callback'            => 'et_agent_maintenance_disable',
+        'permission_callback' => $permission,
+    ]);
+
+    // GET /maintenance/status
+    register_rest_route($namespace, '/maintenance/status', [
+        'methods'             => 'GET',
+        'callback'            => 'et_agent_maintenance_status',
+        'permission_callback' => $permission,
+    ]);
+
     register_rest_route($namespace, '/install-plugin', [
         'methods'             => 'POST',
         'callback'            => 'et_agent_install_plugin',
@@ -471,6 +492,161 @@ function et_agent_collect_error_logs(int $lines): array {
         $result['note'] = 'No log sources detected. Check WP_DEBUG_LOG and php.ini error_log.';
     }
     return $result;
+}
+
+/* =========================================================================
+   Maintenance mode - drop-in + .maintenance marker dla zawieszonych instalacji
+   ========================================================================= */
+function et_agent_maintenance_enable(\WP_REST_Request $req) {
+    $title = sanitize_text_field((string) $req->get_param('title')) ?: 'Strona czasowo niedostępna';
+    $message = (string) $req->get_param('message');
+    if ($message === '') {
+        $message = 'Strona jest tymczasowo niedostępna. Prosimy o kontakt z administratorem.';
+    }
+    $contact_email = sanitize_email((string) $req->get_param('contact_email'));
+
+    $dropin_path = WP_CONTENT_DIR . '/maintenance.php';
+    $marker_path = ABSPATH . '.maintenance';
+
+    // Get site token to allow drop-in bypass for disable endpoint
+    $site_token = get_option('et_agent_site_token', '');
+    if (!$site_token) {
+        return new \WP_REST_Response(['error' => 'Missing et_agent_site_token option'], 500);
+    }
+
+    // Drop-in: custom HTML 503 z brandingiem + bypass dla /maintenance/disable
+    $dropin = et_agent_render_maintenance_dropin($title, $message, $contact_email, $site_token);
+    if (false === @file_put_contents($dropin_path, $dropin)) {
+        return new \WP_REST_Response(['error' => 'Cannot write drop-in', 'path' => $dropin_path], 500);
+    }
+    @chmod($dropin_path, 0644);
+
+    // Marker: .maintenance z $upgrading = NOW + rok (NIE expire automatycznie)
+    $year_ahead = time() + (365 * 24 * 3600);
+    $marker = "<?php\n\$upgrading = {$year_ahead}; // ET Agent maintenance mode (no auto-expiry)\n";
+    if (false === @file_put_contents($marker_path, $marker)) {
+        @unlink($dropin_path);
+        return new \WP_REST_Response(['error' => 'Cannot write .maintenance marker', 'path' => $marker_path], 500);
+    }
+    @chmod($marker_path, 0644);
+
+    update_option('et_agent_maintenance_enabled_at', gmdate('c'));
+    update_option('et_agent_maintenance_message', $message);
+    update_option('et_agent_maintenance_contact', $contact_email);
+
+    return new \WP_REST_Response([
+        'enabled' => true,
+        'dropin' => $dropin_path,
+        'marker' => $marker_path,
+        'enabled_at' => get_option('et_agent_maintenance_enabled_at'),
+    ]);
+}
+
+function et_agent_maintenance_disable() {
+    $marker_path = ABSPATH . '.maintenance';
+    $dropin_path = WP_CONTENT_DIR . '/maintenance.php';
+
+    $marker_removed = false;
+    $dropin_removed = false;
+    if (file_exists($marker_path)) $marker_removed = @unlink($marker_path);
+    if (file_exists($dropin_path)) $dropin_removed = @unlink($dropin_path);
+
+    delete_option('et_agent_maintenance_enabled_at');
+    delete_option('et_agent_maintenance_message');
+    delete_option('et_agent_maintenance_contact');
+
+    return new \WP_REST_Response([
+        'disabled' => true,
+        'marker_removed' => $marker_removed,
+        'dropin_removed' => $dropin_removed,
+    ]);
+}
+
+function et_agent_maintenance_status() {
+    $marker_path = ABSPATH . '.maintenance';
+    $dropin_path = WP_CONTENT_DIR . '/maintenance.php';
+    return new \WP_REST_Response([
+        'enabled' => file_exists($marker_path),
+        'marker_exists' => file_exists($marker_path),
+        'dropin_exists' => file_exists($dropin_path),
+        'enabled_at' => get_option('et_agent_maintenance_enabled_at'),
+        'message' => get_option('et_agent_maintenance_message'),
+        'contact' => get_option('et_agent_maintenance_contact'),
+    ]);
+}
+
+function et_agent_render_maintenance_dropin(string $title, string $message, string $contact_email, string $site_token): string {
+    $title_html = esc_html($title);
+    // Allow simple line breaks but escape HTML
+    $message_html = nl2br(esc_html($message));
+    $contact_block = '';
+    if ($contact_email) {
+        $email_esc = esc_attr($contact_email);
+        $email_html = esc_html($contact_email);
+        $contact_block = '<p class="contact">Kontakt: <a href="mailto:' . $email_esc . '">' . $email_html . '</a></p>';
+    }
+    // Hardcoded into drop-in so /maintenance/disable can self-authorize without WP REST
+    $token_escaped = addslashes($site_token);
+
+    return <<<PHP
+<?php
+// Generated by ET Agent (et-agent plugin) - do not edit by hand.
+// Removal: POST /wp-json/et-agent/v1/maintenance/disable z naglowkiem X-ET-Agent-Token
+
+// === Bypass: gdy CRM wywoluje /maintenance/disable, ten drop-in samodzielnie wylacza maintenance ===
+\$__et_uri = \$_SERVER['REQUEST_URI'] ?? '';
+\$__et_auth = \$_SERVER['HTTP_X_ET_AGENT_TOKEN'] ?? '';
+\$__et_token = '{$token_escaped}';
+if (\$__et_auth === \$__et_token && \$__et_token !== '') {
+    if (strpos(\$__et_uri, '/wp-json/et-agent/v1/maintenance/disable') !== false) {
+        \$marker = ABSPATH . '.maintenance';
+        \$dropin = __FILE__;
+        \$marker_removed = file_exists(\$marker) ? @unlink(\$marker) : false;
+        \$dropin_removed = @unlink(\$dropin);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['disabled' => true, 'method' => 'dropin_bypass', 'marker_removed' => \$marker_removed, 'dropin_removed' => \$dropin_removed]);
+        exit;
+    }
+    if (strpos(\$__et_uri, '/wp-json/et-agent/v1/maintenance/status') !== false) {
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['enabled' => true, 'method' => 'dropin_bypass', 'marker_exists' => file_exists(ABSPATH . '.maintenance'), 'dropin_exists' => true]);
+        exit;
+    }
+}
+
+// === 503 maintenance page dla wszystkich pozostalych requestow ===
+\$protocol = (!empty(\$_SERVER['SERVER_PROTOCOL']) && in_array(\$_SERVER['SERVER_PROTOCOL'], ['HTTP/1.1','HTTP/2','HTTP/2.0'], true))
+    ? \$_SERVER['SERVER_PROTOCOL'] : 'HTTP/1.0';
+header(\$protocol . ' 503 Service Unavailable', true, 503);
+header('Content-Type: text/html; charset=utf-8');
+header('Retry-After: 3600');
+?><!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<title>{$title_html}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: linear-gradient(135deg, #f5f7fa 0%, #e8edf2 100%); margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; color: #1a202c; }
+  .box { max-width: 520px; width: 90%; padding: 48px 36px; background: white; border-radius: 16px; box-shadow: 0 10px 40px rgba(0,0,0,0.08); text-align: center; }
+  h1 { margin: 0 0 16px; font-size: 28px; font-weight: 700; letter-spacing: -0.02em; }
+  p { color: #4a5568; line-height: 1.65; margin: 12px 0; font-size: 16px; }
+  p.contact { margin-top: 24px; padding-top: 20px; border-top: 1px solid #e2e8f0; font-size: 15px; }
+  a { color: #f97316; text-decoration: none; font-weight: 500; }
+  a:hover { text-decoration: underline; }
+  .icon { width: 64px; height: 64px; margin: 0 auto 24px; background: #fff7ed; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 32px; }
+</style>
+</head>
+<body>
+  <main class="box" role="main">
+    <div class="icon" aria-hidden="true">⏸</div>
+    <h1>{$title_html}</h1>
+    <p>{$message_html}</p>
+    {$contact_block}
+  </main>
+</body>
+</html>
+PHP;
 }
 
 /* =========================================================================
