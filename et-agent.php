@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.3.5
+ * Version: 1.4.0
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.3.5');
+define('ET_AGENT_VERSION', '1.4.0');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -211,6 +211,10 @@ register_activation_hook(__FILE__, function () {
         wp_schedule_single_event(time() + 30, 'et_agent_disk_measure_now');
     }
 
+    if (!wp_next_scheduled('et_agent_log_rotate_cron')) {
+        wp_schedule_event(time() + 300, 'daily', 'et_agent_log_rotate_cron');
+    }
+
     et_agent_cleanup_duplicate_folders();
 
     // Auto-register with CRM (deferred 10s so REST API is fully bootstrapped)
@@ -294,6 +298,9 @@ add_action('init', function () {
         && !wp_next_scheduled('et_agent_disk_measure_now')) {
         wp_schedule_single_event(time() + 60, 'et_agent_disk_measure_now');
     }
+    if (!wp_next_scheduled('et_agent_log_rotate_cron')) {
+        wp_schedule_event(time() + 300, 'daily', 'et_agent_log_rotate_cron');
+    }
 });
 
 register_deactivation_hook(__FILE__, function () {
@@ -301,6 +308,7 @@ register_deactivation_hook(__FILE__, function () {
     wp_clear_scheduled_hook('et_agent_users_peak_cron');
     wp_clear_scheduled_hook('et_agent_disk_measure_cron');
     wp_clear_scheduled_hook('et_agent_disk_measure_now');
+    wp_clear_scheduled_hook('et_agent_log_rotate_cron');
 });
 
 /* =========================================================================
@@ -1294,6 +1302,83 @@ function et_agent_measure_disk_usage(): ?int {
 
 add_action('et_agent_disk_measure_cron', 'et_agent_measure_disk_usage');
 add_action('et_agent_disk_measure_now', 'et_agent_measure_disk_usage');
+
+/* =========================================================================
+   Log rotation — dzienna rotacja (gzip) przerośniętych logów.
+   Zapobiega "runaway log" (np. uploads/wp-vimeo-videos/debug.log puchnący do GB).
+   Próg 20 MB → kompresja do *.1.gz, oryginał usuwany (wtyczka odtworzy plik).
+   ========================================================================= */
+
+if (!defined('ET_AGENT_LOG_ROTATE_MAX')) {
+    define('ET_AGENT_LOG_ROTATE_MAX', 20971520); // 20 MB
+}
+
+add_action('et_agent_log_rotate_cron', 'et_agent_rotate_logs');
+
+function et_agent_log_rotate_targets(): array {
+    $targets = [];
+    if (defined('WP_CONTENT_DIR')) {
+        $targets[] = WP_CONTENT_DIR . '/debug.log';
+    }
+    if (function_exists('wp_get_upload_dir')) {
+        $up = wp_get_upload_dir();
+        if (!empty($up['basedir'])) {
+            $targets[] = trailingslashit($up['basedir']) . 'wp-vimeo-videos/debug.log';
+        }
+    }
+    return apply_filters('et_agent_log_rotate_targets', $targets);
+}
+
+function et_agent_rotate_logs(): void {
+    $max = ET_AGENT_LOG_ROTATE_MAX;
+    foreach (et_agent_log_rotate_targets() as $f) {
+        if (!is_string($f) || !is_file($f) || !is_writable($f)) {
+            continue;
+        }
+        $size = @filesize($f);
+        if ($size === false || $size < $max) {
+            continue;
+        }
+
+        $rotated = false;
+        if (function_exists('gzopen')) {
+            $gz = $f . '.1.gz';
+            @unlink($gz);
+            $in  = @fopen($f, 'rb');
+            $out = @gzopen($gz, 'wb9');
+            if ($in && $out) {
+                while (!feof($in)) {
+                    gzwrite($out, fread($in, 262144));
+                }
+                fclose($in);
+                gzclose($out);
+                @unlink($f); // wtyczka odtworzy plik przy kolejnym zapisie
+                $rotated = true;
+            } else {
+                if ($in) { fclose($in); }
+                if ($out) { gzclose($out); }
+            }
+        }
+        if (!$rotated) {
+            $rotated = @rename($f, $f . '.1');
+        }
+        if ($rotated) {
+            error_log('[et-agent] log-rotate: ' . $f . ' (' . $size . ' B)');
+        }
+    }
+}
+
+/* =========================================================================
+   Simple History — retencja zdarzeń 90 dni (free default = 60).
+   No-op gdy Simple History nie jest zainstalowane.
+   ========================================================================= */
+
+add_filter('simple_history/db_purge_days_interval', 'et_agent_sh_retention_days');
+add_filter('simple_history_db_purge_days_interval', 'et_agent_sh_retention_days'); // deprecated alias
+
+function et_agent_sh_retention_days($days) {
+    return 90;
+}
 
 /* =========================================================================
    Endpoint callbacks
