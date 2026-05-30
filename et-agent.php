@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.4.0
+ * Version: 1.5.0
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.4.0');
+define('ET_AGENT_VERSION', '1.5.0');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -1179,20 +1179,26 @@ function et_agent_collect_report(): array {
     $disk = et_agent_get_disk_usage();
 
     $users_count = (int) count_users()['total_users'];
+    $ours_count  = function_exists('et_agent_count_ours_users') ? et_agent_count_ours_users() : 0;
+    $users_real  = max(0, $users_count - $ours_count);
 
     return [
-        'wp_version'  => get_bloginfo('version'),
-        'php_version' => PHP_VERSION,
-        'plugins'     => $plugins,
-        'theme'       => [
+        'wp_version'       => get_bloginfo('version'),
+        'php_version'      => PHP_VERSION,
+        'plugins'          => $plugins,
+        'theme'            => [
             'name'    => $theme->get('Name'),
             'version' => $theme->get('Version'),
         ],
-        'disk'        => $disk,
-        'users_count' => $users_count,
-        'users_peak'  => get_option('et_agent_users_peak', []),
-        'site_url'    => get_site_url(),
-        'admin_email' => get_option('admin_email'),
+        'disk'             => $disk,
+        'users_count'      => $users_count,
+        'users_peak'       => get_option('et_agent_users_peak', []),
+        // NEW od 1.5.0 — real = total - konta @etechnologie.pl (serwisowe).
+        'users_ours_count' => $ours_count,
+        'users_real_count' => $users_real,
+        'users_real_peak'  => get_option('et_agent_users_real_peak', []),
+        'site_url'         => get_site_url(),
+        'admin_email'      => get_option('admin_email'),
     ];
 }
 
@@ -1445,12 +1451,52 @@ add_action('et_agent_report_cron', 'et_agent_send_report');
 /* --- Users peak tracking (daily cron) --- */
 add_action('et_agent_users_peak_cron', 'et_agent_update_users_peak');
 
+if (!function_exists('et_agent_count_ours_users')) {
+    /**
+     * Liczba kont WP konczacych sie na @etechnologie.pl (konta serwisowe/adminow ET).
+     * Uzywane do wyliczenia real users = total - ours w raporcie peak (od v1.5.0).
+     * Defensive: zwraca 0 gdy $wpdb niedostepny lub zapytanie pada — fatal w
+     * helperze nie moze zabic daily cron-a na ~60 instalacjach.
+     */
+    function et_agent_count_ours_users(): int {
+        global $wpdb;
+        if (!isset($wpdb) || !is_object($wpdb)) {
+            return 0;
+        }
+        try {
+            // Suffix match (konczy sie na @etechnologie.pl) — bez false-positives typu
+            // 'x@etechnologie.pl@evil.com'. Aliasy + foo+bar@etechnologie.pl dalej OK.
+            $like = '%' . $wpdb->esc_like('@etechnologie.pl');
+            $sql  = $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->users} WHERE user_email LIKE %s",
+                $like
+            );
+            $count = $wpdb->get_var($sql);
+            return ($count === null) ? 0 : (int) $count;
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+}
+
 function et_agent_update_users_peak(): void {
     $current_count = (int) count_users()['total_users'];
+    $ours_count    = function_exists('et_agent_count_ours_users') ? et_agent_count_ours_users() : 0;
+    $real_count    = max(0, $current_count - $ours_count);
+
     $month_key = date('Y-m');
+
+    // Legacy total peak (backward compat — CRM nadal czyta to pole).
     $peak = get_option('et_agent_users_peak', []);
-    $peak[$month_key] = max($peak[$month_key] ?? 0, $current_count);
+    if (!is_array($peak)) { $peak = []; }
+    $peak[$month_key] = max((int) ($peak[$month_key] ?? 0), $current_count);
     update_option('et_agent_users_peak', $peak, false);
+
+    // NEW od 1.5.0: real peak (total - konta @etechnologie.pl).
+    $real_peak = get_option('et_agent_users_real_peak', []);
+    if (!is_array($real_peak)) { $real_peak = []; }
+    $real_peak[$month_key] = max((int) ($real_peak[$month_key] ?? 0), $real_count);
+    update_option('et_agent_users_real_peak', $real_peak, false);
 }
 
 function et_agent_send_report(): void {
