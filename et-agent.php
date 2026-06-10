@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.5.0
+ * Version: 1.5.1
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
@@ -405,6 +405,12 @@ add_action('rest_api_init', function () {
     register_rest_route($namespace, '/update-plugin', [
         'methods'             => 'POST',
         'callback'            => 'et_agent_update_plugin',
+        'permission_callback' => $permission,
+    ]);
+
+    register_rest_route($namespace, '/delete-plugin', [
+        'methods'             => 'POST',
+        'callback'            => 'et_agent_delete_plugin',
         'permission_callback' => $permission,
     ]);
 
@@ -1023,6 +1029,44 @@ function et_agent_update_plugin(\WP_REST_Request $request): \WP_REST_Response {
         'old_version' => $old_version,
         'new_version' => $new_version,
     ]);
+}
+
+function et_agent_delete_plugin(\WP_REST_Request $request): \WP_REST_Response {
+    $body = $request->get_json_params();
+    $slug = sanitize_key($body['slug'] ?? '');
+
+    if (empty($slug)) {
+        return new \WP_REST_Response(['error' => 'Missing slug'], 400);
+    }
+
+    require_once ABSPATH . 'wp-admin/includes/plugin.php';
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+
+    $all_plugins = get_plugins();
+    $plugin_file = null;
+    foreach ($all_plugins as $file => $data) {
+        if (dirname($file) === $slug) {
+            $plugin_file = $file;
+            break;
+        }
+    }
+
+    if (!$plugin_file) {
+        return new \WP_REST_Response(['status' => 'not_found', 'slug' => $slug], 200);
+    }
+
+    if (is_plugin_active($plugin_file)) {
+        deactivate_plugins($plugin_file);
+    }
+
+    WP_Filesystem();
+    $result = delete_plugins([$plugin_file]);
+
+    if (is_wp_error($result)) {
+        return new \WP_REST_Response(['error' => $result->get_error_message()], 500);
+    }
+
+    return new \WP_REST_Response(['status' => 'deleted', 'plugin' => $plugin_file]);
 }
 
 /* =========================================================================
