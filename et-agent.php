@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.6.0
+ * Version: 1.6.1
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.6.0');
+define('ET_AGENT_VERSION', '1.6.1');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -1659,6 +1659,7 @@ add_action('admin_notices', function () {
    ========================================================================= */
 
 define( 'ET_AGENT_SENTRY_MU_VERSION', '1.0.0' );
+define( 'ET_AGENT_SENTRY_DSN_DEFAULT', 'https://5609d86d3ad1a0ec6eaa29a2dc463c8b@o4511619328770048.ingest.de.sentry.io/4511619343319120' );
 
 function et_agent_find_wpconfig(): string {
     $a = ABSPATH . 'wp-config.php';
@@ -1732,14 +1733,9 @@ add_action( 'admin_init', static function (): void {
     check_admin_referer( 'et_agent_sentry' );
     $action = sanitize_text_field( $_POST['et_agent_sentry_action'] );
     if ( $action === 'enable' ) {
-        $dsn = sanitize_text_field( $_POST['et_agent_sentry_dsn'] ?? '' );
-        if ( ! $dsn ) {
-            add_settings_error( 'et_agent_sentry', 'no_dsn', 'Podaj DSN Sentry.', 'error' );
-            return;
-        }
-        update_option( 'et_agent_sentry_dsn', $dsn );
+        $dsn = ET_AGENT_SENTRY_DSN_DEFAULT;
         if ( et_agent_sentry_write( $dsn ) ) {
-            add_settings_error( 'et_agent_sentry', 'enabled', 'Monitoring Sentry włączony — DSN zapisany w wp-config.php.', 'updated' );
+            add_settings_error( 'et_agent_sentry', 'enabled', 'Monitoring Sentry włączony.', 'updated' );
         } else {
             add_settings_error( 'et_agent_sentry', 'wpconfig_fail',
                 'Nie można zapisać do wp-config.php (sprawdź uprawnienia). Dodaj ręcznie: <code>define( \'ETECHNOLOGIE_SENTRY_DSN\', \'' . esc_html( $dsn ) . '\' );</code>',
@@ -1902,27 +1898,16 @@ function et_agent_settings_page(): void {
         </p>
         <form method="post">
             <?php wp_nonce_field( 'et_agent_sentry' ); ?>
-            <table class="form-table">
-                <tr>
-                    <th scope="row">Sentry DSN</th>
-                    <td>
-                        <input type="password" name="et_agent_sentry_dsn"
-                               value="<?php echo esc_attr( get_option( 'et_agent_sentry_dsn', '' ) ); ?>"
-                               class="regular-text" autocomplete="off"
-                               placeholder="https://xxx@oNNN.ingest.sentry.io/NNN" />
-                        <p class="description">DSN z projektu Sentry.io (Settings → Client Keys → DSN).</p>
-                    </td>
-                </tr>
-            </table>
             <p>
+                <?php if ( ! $sentry_active ) : ?>
                 <button type="submit" name="et_agent_sentry_action" value="enable"
                         class="button button-primary">
-                    <?php echo $sentry_active ? 'Aktualizuj DSN' : 'Włącz monitoring'; ?>
+                    Włącz monitoring
                 </button>
-                <?php if ( $sentry_active ) : ?>
+                <?php else : ?>
                 <button type="submit" name="et_agent_sentry_action" value="disable"
                         class="button button-secondary"
-                        onclick="return confirm('Usunąć ETECHNOLOGIE_SENTRY_DSN z wp-config.php?');">
+                        onclick="return confirm('Wyłączyć monitoring Sentry?');">
                     Wyłącz monitoring
                 </button>
                 <?php endif; ?>
