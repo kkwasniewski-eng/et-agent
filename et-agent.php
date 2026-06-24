@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.5.1
+ * Version: 1.6.0
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.5.0');
+define('ET_AGENT_VERSION', '1.6.0');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -1655,6 +1655,104 @@ add_action('admin_notices', function () {
 });
 
 /* =========================================================================
+   Sentry error monitoring
+   ========================================================================= */
+
+define( 'ET_AGENT_SENTRY_MU_VERSION', '1.0.0' );
+
+function et_agent_find_wpconfig(): string {
+    $a = ABSPATH . 'wp-config.php';
+    if ( file_exists( $a ) ) return $a;
+    $b = dirname( ABSPATH ) . '/wp-config.php';
+    if ( file_exists( $b ) ) return $b;
+    return '';
+}
+
+function et_agent_sentry_active(): bool {
+    $path = et_agent_find_wpconfig();
+    if ( ! $path ) return false;
+    $src = @file_get_contents( $path );
+    return $src !== false && (bool) preg_match(
+        "/define\s*\(\s*['\"]ETECHNOLOGIE_SENTRY_DSN['\"].*\)/",
+        $src
+    );
+}
+
+function et_agent_sentry_write( string $dsn ): bool {
+    $path = et_agent_find_wpconfig();
+    if ( ! $path || ! is_writable( $path ) ) return false;
+    $src = file_get_contents( $path );
+    if ( $src === false ) return false;
+    $src = preg_replace( "/^[^\n]*define\s*\(\s*['\"]ETECHNOLOGIE_SENTRY_DSN['\"][^\n]*\n?/m", '', $src );
+    if ( $dsn !== '' ) {
+        $line = "define( 'ETECHNOLOGIE_SENTRY_DSN', '" . addslashes( $dsn ) . "' ); // et-agent\n";
+        foreach ( [ "/* That's all, stop editing!", '/* Stop editing!', '/** Absolute path' ] as $marker ) {
+            $pos = strpos( $src, $marker );
+            if ( $pos !== false ) {
+                $src = substr_replace( $src, $line, $pos, 0 );
+                break;
+            }
+        }
+    }
+    return file_put_contents( $path, $src ) !== false;
+}
+
+// Auto-install et-sentry mu-plugin on first admin pageload
+add_action( 'admin_init', static function (): void {
+    if ( get_option( 'et_sentry_mu_version' ) === ET_AGENT_SENTRY_MU_VERSION ) return;
+    $mu_dir  = defined( 'WPMU_PLUGIN_DIR' ) ? WPMU_PLUGIN_DIR : WP_CONTENT_DIR . '/mu-plugins';
+    $bundled = plugin_dir_path( __FILE__ ) . 'mu-plugins-src/et-sentry.php';
+    if ( ! is_readable( $bundled ) ) return;
+    if ( ! is_dir( $mu_dir ) ) { @mkdir( $mu_dir, 0755, true ); }
+    if ( ! is_dir( $mu_dir ) || ! is_writable( $mu_dir ) ) return;
+    $src = file_get_contents( $bundled );
+    if ( $src !== false && false !== @file_put_contents( $mu_dir . '/et-sentry.php', $src ) ) {
+        update_option( 'et_sentry_mu_version', ET_AGENT_SENTRY_MU_VERSION );
+    }
+} );
+
+// Full-site ET_Sentry init (no before_send filter — catches errors from all plugins/themes)
+add_action( 'plugins_loaded', static function (): void {
+    if ( ! defined( 'ETECHNOLOGIE_SENTRY_DSN' ) || ! ETECHNOLOGIE_SENTRY_DSN ) return;
+    if ( ! defined( 'ET_SENTRY_LOADED' ) ) return;
+    if ( defined( 'ETECHNOLOGIE_SENTRY_INITIALIZED' ) ) return;
+    define( 'ETECHNOLOGIE_SENTRY_INITIALIZED', true );
+    ET_Sentry::init( [
+        'dsn'         => (string) ETECHNOLOGIE_SENTRY_DSN,
+        'environment' => function_exists( 'wp_get_environment_type' ) ? wp_get_environment_type() : 'production',
+        'release'     => 'wordpress@' . get_bloginfo( 'version' ),
+    ] );
+    ET_Sentry::setTag( 'site', (string) wp_parse_url( get_site_url(), PHP_URL_HOST ) );
+}, 1 );
+
+// Handle Sentry enable/disable form
+add_action( 'admin_init', static function (): void {
+    if ( ! isset( $_POST['et_agent_sentry_action'] ) ) return;
+    if ( ! current_user_can( 'manage_options' ) ) return;
+    check_admin_referer( 'et_agent_sentry' );
+    $action = sanitize_text_field( $_POST['et_agent_sentry_action'] );
+    if ( $action === 'enable' ) {
+        $dsn = sanitize_text_field( $_POST['et_agent_sentry_dsn'] ?? '' );
+        if ( ! $dsn ) {
+            add_settings_error( 'et_agent_sentry', 'no_dsn', 'Podaj DSN Sentry.', 'error' );
+            return;
+        }
+        update_option( 'et_agent_sentry_dsn', $dsn );
+        if ( et_agent_sentry_write( $dsn ) ) {
+            add_settings_error( 'et_agent_sentry', 'enabled', 'Monitoring Sentry włączony — DSN zapisany w wp-config.php.', 'updated' );
+        } else {
+            add_settings_error( 'et_agent_sentry', 'wpconfig_fail',
+                'Nie można zapisać do wp-config.php (sprawdź uprawnienia). Dodaj ręcznie: <code>define( \'ETECHNOLOGIE_SENTRY_DSN\', \'' . esc_html( $dsn ) . '\' );</code>',
+                'error'
+            );
+        }
+    } elseif ( $action === 'disable' ) {
+        et_agent_sentry_write( '' );
+        add_settings_error( 'et_agent_sentry', 'disabled', 'Monitoring Sentry wyłączony — linia usunięta z wp-config.php.', 'updated' );
+    }
+} );
+
+/* =========================================================================
    Settings page
    ========================================================================= */
 
@@ -1791,6 +1889,43 @@ function et_agent_settings_page(): void {
                 <button type="submit" name="et_agent_send_now" value="1" class="button button-secondary">
                     Wyślij raport teraz
                 </button>
+            </p>
+        </form>
+
+        <hr />
+        <h2>Monitoring błędów (Sentry)</h2>
+        <?php settings_errors( 'et_agent_sentry' ); ?>
+        <?php $sentry_active = et_agent_sentry_active(); ?>
+        <p>Status: <?php echo $sentry_active
+            ? '<strong style="color:#46b450">✅ Aktywny</strong>'
+            : '<strong style="color:#dc3232">❌ Nieaktywny</strong>'; ?>
+        </p>
+        <form method="post">
+            <?php wp_nonce_field( 'et_agent_sentry' ); ?>
+            <table class="form-table">
+                <tr>
+                    <th scope="row">Sentry DSN</th>
+                    <td>
+                        <input type="password" name="et_agent_sentry_dsn"
+                               value="<?php echo esc_attr( get_option( 'et_agent_sentry_dsn', '' ) ); ?>"
+                               class="regular-text" autocomplete="off"
+                               placeholder="https://xxx@oNNN.ingest.sentry.io/NNN" />
+                        <p class="description">DSN z projektu Sentry.io (Settings → Client Keys → DSN).</p>
+                    </td>
+                </tr>
+            </table>
+            <p>
+                <button type="submit" name="et_agent_sentry_action" value="enable"
+                        class="button button-primary">
+                    <?php echo $sentry_active ? 'Aktualizuj DSN' : 'Włącz monitoring'; ?>
+                </button>
+                <?php if ( $sentry_active ) : ?>
+                <button type="submit" name="et_agent_sentry_action" value="disable"
+                        class="button button-secondary"
+                        onclick="return confirm('Usunąć ETECHNOLOGIE_SENTRY_DSN z wp-config.php?');">
+                    Wyłącz monitoring
+                </button>
+                <?php endif; ?>
             </p>
         </form>
     </div>
