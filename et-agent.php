@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ET Agent
  * Description: Agent monitorujący instalację WordPress dla CRM eTechnologie
- * Version: 1.6.2
+ * Version: 1.6.3
  * Author: eTechnologie
  * Requires PHP: 7.4
  */
 
 defined('ABSPATH') || exit;
 
-define('ET_AGENT_VERSION', '1.6.2');
+define('ET_AGENT_VERSION', '1.6.3');
 define('ET_AGENT_GITHUB_REPO', 'kkwasniewski-eng/et-agent');
 
 /* BuddyBoss: whitelist ET-Agent REST endpoints from private API restriction */
@@ -1697,7 +1697,7 @@ function et_agent_sentry_write( string $dsn ): bool {
             }
         }
         if ( ! $inserted ) {
-            // Fallback: no standard marker found — append before closing ?> or at end of file.
+            // Fallback: no standard marker found — append before closing PHP tag or at end of file.
             if ( preg_match( '/\?>\s*$/', $src ) ) {
                 $src = preg_replace( '/(\?>\s*)$/', $line . '$1', $src );
             } else {
